@@ -1,7 +1,8 @@
 import path from "node:path";
 import fs from "fs-extra";
+import { allRootMarkers } from "./profile.js";
 
-const rootMarkers = [".git", "package.json", "pyproject.toml", "go.mod", "Cargo.toml", "pom.xml", "build.gradle", "pubspec.yaml"];
+const rootMarkers = [".git", ...allRootMarkers];
 
 export async function findProjectRoot(startDir = process.cwd()): Promise<string> {
   let current = path.resolve(startDir);

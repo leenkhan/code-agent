@@ -2,6 +2,8 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { assertCommandAllowed } from "../safety/command-policy.js";
 import { redactSecrets } from "../safety/secrets.js";
 import { compactOutput } from "../ui/command-output.js";
+import type { ProjectProfile } from "../types.js";
+import { isLongRunningCommandForProfile } from "../project/profile.js";
 
 export type RunningCommand = {
   id: number;
@@ -19,13 +21,21 @@ const longRunningPatterns = [
   /\bpnpm\s+dev\b/i,
   /\byarn\s+dev\b/i,
   /\bnext\s+dev\b/i,
-  /\bvite\b/i
+  /\bvite\b/i,
+  /\bmvn\b.*spring-boot:run\b/i,
+  /\b\.\/mvnw\b.*spring-boot:run\b/i,
+  /\bgradle\b.*bootRun\b/i,
+  /\b\.\/gradlew\b.*bootRun\b/i
 ];
 
 let nextId = 1;
 
 export function isLongRunningCommand(command: string): boolean {
   return longRunningPatterns.some((pattern) => pattern.test(command));
+}
+
+export function isLongRunningCommandForProject(command: string, profile?: ProjectProfile): boolean {
+  return isLongRunningCommandForProfile(command, profile);
 }
 
 export function startBackgroundCommand(root: string, command: string): RunningCommand {

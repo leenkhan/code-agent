@@ -75,8 +75,7 @@ describe("code actions", () => {
       "Generating file actions: drafting complete plan",
       "Generating file actions: planning file list",
       "Generating file actions: parsing file list",
-      "Generating file actions: file 1/1 main.py",
-      "Generating file actions: parsing main.py",
+      "Generating file actions: files 1-1/1",
       "Generating file actions: assembling plan"
     ]);
   });
@@ -111,6 +110,6 @@ describe("code actions", () => {
     expect(calls[0]).toContain("compact file manifest");
     expect(plan.files).toEqual([{ path: "build.gradle.kts", content: "plugins {}\n" }]);
     expect(progress[0]).toBe("Generating file actions: planning file list");
-    expect(progress).toContain("Generating file actions: file 1/1 build.gradle.kts");
+    expect(progress).toContain("Generating file actions: files 1-1/1");
   });
 });

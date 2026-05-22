@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createLlmProvider } from "../src/llm/factory.js";
+import { AnthropicCompatibleProvider } from "../src/llm/anthropic.js";
 import type { RuntimeConfig } from "../src/types.js";
 
 const baseConfig: RuntimeConfig = {
@@ -24,5 +25,15 @@ describe("createLlmProvider", () => {
 
   it("reports the correct missing env var for openai", () => {
     expect(() => createLlmProvider({ ...baseConfig, provider: "openai", apiKey: undefined })).toThrow("OPENAI_API_KEY");
+  });
+
+  it("uses Anthropic-compatible provider for /anthropic base URLs", () => {
+    const provider = createLlmProvider({
+      ...baseConfig,
+      provider: "openai",
+      baseUrl: "https://api.deepseek.com/anthropic"
+    });
+
+    expect(provider).toBeInstanceOf(AnthropicCompatibleProvider);
   });
 });

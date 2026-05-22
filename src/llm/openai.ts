@@ -8,7 +8,10 @@ async function sleep(ms: number): Promise<void> {
 }
 
 function isRetryableError(error: unknown): boolean {
-  if (error instanceof OpenAI.APIError) {
+  if (error instanceof Error && error.message.includes("LLM response did not include text content")) {
+    return false;
+  }
+  if (typeof OpenAI.APIError === "function" && error instanceof OpenAI.APIError) {
     if (error.status && retryableStatuses.has(error.status)) return true;
     return false;
   }
@@ -65,14 +68,80 @@ export class OpenAiProvider implements LlmProvider {
     throw lastError;
   }
 
-  private async withTimeout<T>(fn: (signal: AbortSignal) => Promise<{ readonly choices: Array<{ readonly message?: { readonly content?: string | null } | null }> }>): Promise<string> {
+  private async withTimeout<T>(fn: (signal: AbortSignal) => Promise<T>): Promise<string> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
       const response = await fn(controller.signal);
-      return response.choices[0]?.message?.content ?? "";
+      const text = extractText(response);
+      if (!text.trim()) {
+        throw new Error(`LLM response did not include text content. Response shape: ${summarizeResponse(response)}`);
+      }
+      return text;
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        throw new Error(`LLM request timed out after ${this.timeoutMs}ms`);
+      }
+      throw error;
     } finally {
       clearTimeout(timer);
     }
   }
+}
+
+function extractText(response: unknown): string {
+  if (!response || typeof response !== "object") return "";
+  const record = response as Record<string, unknown>;
+
+  const text = record.output_text;
+  if (typeof text === "string") return text;
+
+  const output = record.output;
+  if (Array.isArray(output)) {
+    const parts = output.flatMap((item) => {
+      if (!item || typeof item !== "object") return [];
+      const content = (item as Record<string, unknown>).content;
+      if (typeof content === "string") return [content];
+      if (Array.isArray(content)) {
+        return content.flatMap((part) => {
+          if (!part || typeof part !== "object") return [];
+          const partRecord = part as Record<string, unknown>;
+          if (typeof partRecord.text === "string") return [partRecord.text];
+          if (typeof partRecord.content === "string") return [partRecord.content];
+          return [];
+        });
+      }
+      return [];
+    });
+    if (parts.length > 0) return parts.join("");
+  }
+
+  const choices = record.choices;
+  if (Array.isArray(choices)) {
+    for (const choice of choices) {
+      if (!choice || typeof choice !== "object") continue;
+      const message = (choice as Record<string, unknown>).message;
+      if (!message || typeof message !== "object") continue;
+      const content = (message as Record<string, unknown>).content;
+      if (typeof content === "string") return content;
+      if (Array.isArray(content)) {
+        const parts = content.flatMap((part) => {
+          if (!part || typeof part !== "object") return [];
+          const partRecord = part as Record<string, unknown>;
+          if (typeof partRecord.text === "string") return [partRecord.text];
+          if (typeof partRecord.content === "string") return [partRecord.content];
+          return [];
+        });
+        if (parts.length > 0) return parts.join("");
+      }
+    }
+  }
+
+  return "";
+}
+
+function summarizeResponse(response: unknown): string {
+  if (!response || typeof response !== "object") return String(response);
+  const keys = Object.keys(response as Record<string, unknown>);
+  return keys.length > 0 ? `keys=${keys.join(",")}` : "empty-object";
 }

@@ -89,6 +89,7 @@ const { mockState } = vi.hoisted(() => ({
   mockState: {
     inputIndex: 0,
     userMessages: [] as string[],
+    promptMessages: [] as string[],
     inputs: [
       "帮我创建一个 TypeScript 数学工具库项目，要包含加减乘除四个函数，以及完整的单元测试",
       "/exit"
@@ -97,7 +98,8 @@ const { mockState } = vi.hoisted(() => ({
 }));
 
 vi.mock("@inquirer/prompts", () => ({
-  input: vi.fn().mockImplementation(async () => {
+  input: vi.fn().mockImplementation(async (config: { message?: string }) => {
+    mockState.promptMessages.push(config.message ?? "");
     const inputs = mockState.inputs;
     const value = inputs[mockState.inputIndex] ?? "/exit";
     if (mockState.inputIndex < inputs.length) mockState.inputIndex += 1;
@@ -111,6 +113,7 @@ vi.mock("@inquirer/prompts", () => ({
 
 import { chatCommand } from "../src/commands/chat.js";
 import { createLlmProvider } from "../src/llm/factory.js";
+import { confirm } from "@inquirer/prompts";
 import type { LlmProvider } from "../src/llm/provider.js";
 
 vi.mock("../src/llm/factory.js", () => ({
@@ -138,6 +141,56 @@ function makeSuccessProvider(): LlmProvider {
       return JSON.stringify({ intent: "answer", answer: "done" });
     }
   };
+}
+
+function makePlanOnlyProvider() {
+  const calls: string[] = [];
+  const provider: LlmProvider = {
+    async generateText(input) {
+      calls.push(input.prompt);
+      if (input.responseFormat === "json_object" && input.prompt.includes("User message:")) {
+        return JSON.stringify({
+          intent: "code_change",
+          task: "should not be used",
+          reason: "plan command should bypass intent classification"
+        });
+      }
+      if (input.prompt.includes("Return JSON with this exact shape")) {
+        return JSON.stringify({
+          summary: "should not generate files",
+          files: [{ path: "should-not-exist.txt", content: "nope" }],
+          commands: [{ command: "npm test", reason: "should not run" }]
+        });
+      }
+      return "Plan only:\n1. Inspect the current project.\n2. Decide the smallest implementation steps.\n3. Ask before making changes.";
+    }
+  };
+  return { provider, calls };
+}
+
+function makePersistentPlanProvider() {
+  const calls: string[] = [];
+  const provider: LlmProvider = {
+    async generateText(input) {
+      calls.push(input.prompt);
+      if (input.responseFormat === "json_object" && input.prompt.includes("Return JSON with this exact shape")) {
+        return JSON.stringify({
+          goal: "Add a reviewed login flow",
+          steps: [{
+            id: "1",
+            title: "Implement login flow",
+            description: "Add the agreed login flow from the plan-mode discussion.",
+            expectedFiles: ["src/login.ts"],
+            verification: "npm test",
+            milestone: false,
+            dependsOn: []
+          }]
+        });
+      }
+      return "Plan discussion reply";
+    }
+  };
+  return { provider, calls };
 }
 
 function makeKotlinProviderThatMisclassifiesCreation(): LlmProvider {
@@ -190,6 +243,7 @@ function makeRepairProvider(brokenResponse: string, fixedResponse: string, retur
 function resetMockState() {
   mockState.inputIndex = 0;
   mockState.userMessages = [];
+  mockState.promptMessages = [];
   mockState.inputs = [
     "帮我创建一个 TypeScript 数学工具库项目，要包含加减乘除四个函数，以及完整的单元测试",
     "/exit"
@@ -258,6 +312,87 @@ describe("chat integration: Kotlin Spring Boot creation intent", () => {
     await chatCommand(root, { autoApply: true, model: "deepseek-v4-pro" });
 
     await expect(fs.readFile(path.join(root, "build.gradle.kts"), "utf8")).resolves.toBe(kotlinBuildGradle);
+  });
+});
+
+describe("chat integration: plan command", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.clearAllMocks();
+    resetMockState();
+  });
+
+  it("runs /plan as a plan-only command without classifying, writing files, or running commands", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-chat-plan-"));
+    vi.stubEnv("DEEPSEEK_API_KEY", "test-key");
+    mockState.inputs = ["/plan add a login flow", "/exit"];
+    const { provider, calls } = makePlanOnlyProvider();
+    vi.mocked(createLlmProvider).mockReturnValue(provider);
+
+    await chatCommand(root, { autoApply: true, model: "deepseek-v4-pro" });
+
+    expect(calls.some((prompt) => prompt.includes("Return JSON matching one of:"))).toBe(false);
+    expect(calls.some((prompt) => prompt.includes("Return JSON with this exact shape"))).toBe(false);
+    await expect(fs.readFile(path.join(root, "should-not-exist.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("uses the next user message as the plan goal after bare /plan", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-chat-plan-next-"));
+    vi.stubEnv("DEEPSEEK_API_KEY", "test-key");
+    mockState.inputs = ["/plan", "add a checkout flow", "/exit"];
+    const { provider, calls } = makePlanOnlyProvider();
+    vi.mocked(createLlmProvider).mockReturnValue(provider);
+
+    await chatCommand(root, { autoApply: true, model: "deepseek-v4-pro" });
+
+    expect(calls.some((prompt) => prompt.includes("add a checkout flow"))).toBe(true);
+    expect(calls.some((prompt) => prompt.includes("Return JSON matching one of:"))).toBe(false);
+    expect(mockState.promptMessages).toContain("you");
+    expect(mockState.promptMessages).toContain("you [PLAN - Shift+Tab exits]");
+  });
+
+  it("exits bare plan mode with /plan exit without calling the model", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-chat-plan-exit-"));
+    vi.stubEnv("DEEPSEEK_API_KEY", "test-key");
+    mockState.inputs = ["/plan", "/plan exit", "/exit"];
+    const { provider, calls } = makePlanOnlyProvider();
+    vi.mocked(createLlmProvider).mockReturnValue(provider);
+
+    await chatCommand(root, { autoApply: true, model: "deepseek-v4-pro" });
+
+    expect(calls).toEqual([]);
+  });
+
+  it("ignores /apply-plan outside plan mode without calling the model", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-chat-apply-plan-inactive-"));
+    vi.stubEnv("DEEPSEEK_API_KEY", "test-key");
+    mockState.inputs = ["/apply-plan", "/exit"];
+    const { provider, calls } = makePlanOnlyProvider();
+    vi.mocked(createLlmProvider).mockReturnValue(provider);
+
+    await chatCommand(root, { autoApply: true, model: "deepseek-v4-pro" });
+
+    expect(calls).toEqual([]);
+  });
+
+  it("applies multi-turn plan mode by generating a task plan and saving it when execution is declined", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-chat-apply-plan-"));
+    vi.stubEnv("DEEPSEEK_API_KEY", "test-key");
+    mockState.inputs = ["/plan add login", "prefer session cookies", "/apply-plan", "/exit"];
+    vi.mocked(confirm).mockResolvedValueOnce(false);
+    const { provider, calls } = makePersistentPlanProvider();
+    vi.mocked(createLlmProvider).mockReturnValue(provider);
+
+    await chatCommand(root, { model: "deepseek-v4-pro" });
+
+    expect(calls.some((prompt) => prompt.includes("prefer session cookies"))).toBe(true);
+    expect(calls.some((prompt) => prompt.includes("Return JSON matching one of:"))).toBe(false);
+    expect(calls.some((prompt) => prompt.includes("Return JSON with this exact shape"))).toBe(true);
+    const taskRoot = path.join(root, ".code-agent", "tasks");
+    const taskIds = await fs.readdir(taskRoot);
+    expect(taskIds).toHaveLength(1);
+    await expect(fs.readFile(path.join(taskRoot, taskIds[0]!, "plan.json"), "utf8")).resolves.toContain("Add a reviewed login flow");
+    await expect(fs.readFile(path.join(root, "src/login.ts"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
 
@@ -429,6 +564,214 @@ function makeGoSuccessProvider(): LlmProvider {
     }
   };
 }
+
+type LanguageChatFixture = {
+  name: string;
+  prompt: string;
+  task: string;
+  files: Record<string, string>;
+  expectedPath: string;
+  expectedContent: string;
+};
+
+const languageChatFixtures: LanguageChatFixture[] = [
+  {
+    name: "JavaScript",
+    prompt: "帮我创建一个 JavaScript 数学工具库项目，包含加减乘除函数",
+    task: "创建 JavaScript 数学工具库",
+    files: {
+      "package.json": JSON.stringify({ name: "js-math-utils", type: "module", scripts: { test: "node --test" } }, null, 2),
+      "src/math.js": [
+        "export function add(a, b) { return a + b; }",
+        "export function subtract(a, b) { return a - b; }",
+        "export function multiply(a, b) { return a * b; }",
+        "export function divide(a, b) { if (b === 0) throw new Error('division by zero'); return a / b; }"
+      ].join("\n")
+    },
+    expectedPath: "src/math.js",
+    expectedContent: "export function add(a, b) { return a + b; }"
+  },
+  {
+    name: "Python",
+    prompt: "帮我创建一个 Python 数学工具库项目，包含加减乘除函数",
+    task: "创建 Python 数学工具库",
+    files: {
+      "pyproject.toml": "[project]\nname = \"py-math-utils\"\nversion = \"0.1.0\"\n",
+      "src/math_utils.py": [
+        "def add(a: int, b: int) -> int:",
+        "    return a + b",
+        "",
+        "def divide(a: int, b: int) -> float:",
+        "    if b == 0:",
+        "        raise ValueError('division by zero')",
+        "    return a / b"
+      ].join("\n")
+    },
+    expectedPath: "src/math_utils.py",
+    expectedContent: "def add(a: int, b: int) -> int:"
+  },
+  {
+    name: "Rust",
+    prompt: "帮我创建一个 Rust 数学工具库项目，包含加减乘除函数",
+    task: "创建 Rust 数学工具库",
+    files: {
+      "Cargo.toml": "[package]\nname = \"rust-math-utils\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+      "src/lib.rs": [
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }",
+        "pub fn subtract(a: i32, b: i32) -> i32 { a - b }",
+        "pub fn multiply(a: i32, b: i32) -> i32 { a * b }",
+        "pub fn divide(a: i32, b: i32) -> Option<i32> { if b == 0 { None } else { Some(a / b) } }"
+      ].join("\n")
+    },
+    expectedPath: "src/lib.rs",
+    expectedContent: "pub fn add(a: i32, b: i32) -> i32 { a + b }"
+  },
+  {
+    name: "Java",
+    prompt: "帮我创建一个 Java 数学工具库项目，包含加减乘除函数",
+    task: "创建 Java 数学工具库",
+    files: {
+      "pom.xml": "<project><modelVersion>4.0.0</modelVersion><groupId>demo</groupId><artifactId>java-math-utils</artifactId><version>0.1.0</version></project>\n",
+      "src/main/java/demo/MathUtils.java": [
+        "package demo;",
+        "",
+        "public final class MathUtils {",
+        "  public static int add(int a, int b) { return a + b; }",
+        "}"
+      ].join("\n")
+    },
+    expectedPath: "src/main/java/demo/MathUtils.java",
+    expectedContent: "public static int add(int a, int b) { return a + b; }"
+  },
+  {
+    name: "Swift",
+    prompt: "帮我创建一个 Swift 数学工具库项目，包含加减乘除函数",
+    task: "创建 Swift 数学工具库",
+    files: {
+      "Package.swift": "// swift-tools-version: 5.9\nimport PackageDescription\nlet package = Package(name: \"SwiftMathUtils\", products: [.library(name: \"SwiftMathUtils\", targets: [\"SwiftMathUtils\"])], targets: [.target(name: \"SwiftMathUtils\")])\n",
+      "Sources/SwiftMathUtils/MathUtils.swift": [
+        "public enum MathUtils {",
+        "  public static func add(_ a: Int, _ b: Int) -> Int { a + b }",
+        "}"
+      ].join("\n")
+    },
+    expectedPath: "Sources/SwiftMathUtils/MathUtils.swift",
+    expectedContent: "public static func add(_ a: Int, _ b: Int) -> Int { a + b }"
+  },
+  {
+    name: "PHP",
+    prompt: "帮我创建一个 PHP 数学工具库项目，包含加减乘除函数",
+    task: "创建 PHP 数学工具库",
+    files: {
+      "composer.json": JSON.stringify({ name: "demo/php-math-utils", autoload: { "psr-4": { "Demo\\Math\\": "src/" } } }, null, 2),
+      "src/MathUtils.php": [
+        "<?php",
+        "namespace Demo\\Math;",
+        "",
+        "final class MathUtils {",
+        "    public static function add(int $a, int $b): int { return $a + $b; }",
+        "}"
+      ].join("\n")
+    },
+    expectedPath: "src/MathUtils.php",
+    expectedContent: "public static function add(int $a, int $b): int { return $a + $b; }"
+  },
+  {
+    name: "Ruby",
+    prompt: "帮我创建一个 Ruby 数学工具库项目，包含加减乘除函数",
+    task: "创建 Ruby 数学工具库",
+    files: {
+      "Gemfile": "source \"https://rubygems.org\"\n",
+      "lib/math_utils.rb": [
+        "module MathUtils",
+        "  def self.add(a, b)",
+        "    a + b",
+        "  end",
+        "end"
+      ].join("\n")
+    },
+    expectedPath: "lib/math_utils.rb",
+    expectedContent: "def self.add(a, b)"
+  },
+  {
+    name: "C#",
+    prompt: "帮我创建一个 C# 数学工具库项目，包含加减乘除函数",
+    task: "创建 C# 数学工具库",
+    files: {
+      "MathUtils.csproj": "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>\n",
+      "MathUtils.cs": [
+        "namespace Demo.Math;",
+        "",
+        "public static class MathUtils",
+        "{",
+        "    public static int Add(int a, int b) => a + b;",
+        "}"
+      ].join("\n")
+    },
+    expectedPath: "MathUtils.cs",
+    expectedContent: "public static int Add(int a, int b) => a + b;"
+  }
+];
+
+function makeLanguageProvider(fixture: LanguageChatFixture): LlmProvider {
+  return {
+    async generateText(input) {
+      if (input.responseFormat === "json_object" && input.prompt.includes("User message:")) {
+        return JSON.stringify({
+          intent: "code_change",
+          task: fixture.task,
+          reason: `用户要求创建 ${fixture.name} 项目`
+        });
+      }
+      if (input.responseFormat === "json_object" && input.prompt.includes("Files to generate")) {
+        return JSON.stringify({
+          files: Object.entries(fixture.files).map(([filePath, content]) => ({ path: filePath, content }))
+        });
+      }
+      if (input.responseFormat === "json_object" && input.prompt.includes("File to generate:")) {
+        const file = JSON.parse(input.prompt.slice(input.prompt.indexOf("File to generate:") + "File to generate:".length).trim()) as { path: string };
+        return JSON.stringify({ path: file.path, content: fixture.files[file.path] ?? "" });
+      }
+      if (input.responseFormat === "json_object" && input.prompt.includes("Return JSON:")) {
+        return JSON.stringify({
+          summary: `Create ${fixture.name} math utility project`,
+          files: Object.keys(fixture.files).map((filePath) => ({ path: filePath, purpose: `${fixture.name} project file` })),
+          commands: []
+        });
+      }
+      if (input.responseFormat === "json_object" && (input.prompt.includes("Return JSON with this exact shape") || input.prompt.includes("Command errors"))) {
+        return JSON.stringify({
+          summary: `Create ${fixture.name} math utility project`,
+          files: Object.entries(fixture.files).map(([filePath, content]) => ({ path: filePath, content })),
+          commands: []
+        });
+      }
+      return JSON.stringify({ intent: "answer", answer: "done" });
+    }
+  };
+}
+
+describe("chat integration: additional language project generation", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.clearAllMocks();
+    resetMockState();
+  });
+
+  it.each(languageChatFixtures)("generates a $name project from chat", async (fixture) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), `code-agent-chat-${fixture.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-`));
+    vi.stubEnv("DEEPSEEK_API_KEY", "test-key");
+    mockState.inputs = [fixture.prompt, "/exit"];
+    vi.mocked(createLlmProvider).mockReturnValue(makeLanguageProvider(fixture));
+
+    await chatCommand(root, { autoApply: true, model: "deepseek-v4-pro" });
+
+    await expect(fs.readFile(path.join(root, fixture.expectedPath), "utf8")).resolves.toContain(fixture.expectedContent);
+    for (const [filePath, content] of Object.entries(fixture.files)) {
+      await expect(fs.readFile(path.join(root, filePath), "utf8")).resolves.toBe(content);
+    }
+  });
+});
 
 describe("chat integration: Go project generation", () => {
   afterEach(() => {

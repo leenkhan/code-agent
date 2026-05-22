@@ -7,6 +7,7 @@ import type { CodeDiagnostic, CodeSymbol, ProjectConfig, ProjectContext } from "
 import { canReadFile } from "../safety/file-policy.js";
 import { gitDiff, gitStatus, isGitRepo } from "../tools/git.js";
 import { importantFileGlobs } from "./detect.js";
+import { buildProjectProfile, allSourceGlobs } from "./profile.js";
 import { readSmallTextFile } from "./files.js";
 
 const maxFileBytes = 100 * 1024;
@@ -23,8 +24,7 @@ const sourceFileGlobs = [
   "app/**/*.{ts,tsx,js,jsx,mts,cts}",
   "test/**/*.{ts,tsx,js,jsx,mts,cts}",
   "tests/**/*.{ts,tsx,js,jsx,mts,cts}",
-  "*.{py,go,rs,java,kt,swift,php,rb,cs}",
-  "**/*.{py,go,rs,java,kt,swift,php,rb,cs}"
+  ...allSourceGlobs
 ];
 
 type TypeScriptModule = typeof import("typescript");
@@ -450,6 +450,7 @@ export async function collectProjectContext(root: string, config: ProjectConfig,
   }
   const semanticContext = await collectSemanticContext(importantFiles);
   const gitAvailable = await isGitRepo(root);
+  const profile = buildProjectProfile(safeFiles);
   return {
     root,
     fileTree: safeFiles,
@@ -458,6 +459,7 @@ export async function collectProjectContext(root: string, config: ProjectConfig,
     diagnostics: semanticContext.diagnostics,
     gitStatus: gitAvailable ? await gitStatus(root) : undefined,
     gitDiff: gitAvailable ? await gitDiff(root) : undefined,
-    task
+    task,
+    profile
   };
 }

@@ -56,7 +56,7 @@ describe("classifyChatIntent", () => {
       }))
     };
 
-    const message = "我想创建一个基于Kotlin, springboo + sqllit的项目，先实现一个用email登录、注册的后端服务框架，运行服务并测试";
+    const message = "我想创建一个基于Kotlin, springboo + sqllit的项目，先实现一个用email登录、注册的后端服务框架";
     const result = await classifyChatIntent({
       provider,
       model: "test",
@@ -71,6 +71,79 @@ describe("classifyChatIntent", () => {
       reason: "The user asked to create or implement project code; any requested run/test steps should happen after file generation."
     });
     expect(provider.generateText).not.toHaveBeenCalled();
+  });
+
+  it("routes create-code-run-and-test requests to file generation first", async () => {
+    const provider: LlmProvider = {
+      generateText: vi.fn(async () => JSON.stringify({
+        intent: "code_change",
+        task: "wrong",
+        reason: "wrong"
+      }))
+    };
+
+    const message = "我想创建一个基于java8,用maven构建, springboot + sqllit的项目，先实现一个用email登录、注册的后端服务框架，编写代码，运行服务并测试";
+    const result = await classifyChatIntent({
+      provider,
+      model: "test",
+      message,
+      history: [],
+      context: { root: "/tmp", fileTree: [], importantFiles: [] }
+    });
+
+    expect(result).toEqual({
+      intent: "code_change",
+      task: message,
+      reason: "The user asked to create or implement project code; any requested run/test steps should happen after file generation."
+    });
+    expect(provider.generateText).not.toHaveBeenCalled();
+  });
+
+  it("routes composite run-and-test goals to task runtime before asking the provider", async () => {
+    const provider: LlmProvider = {
+      generateText: vi.fn(async () => JSON.stringify({
+        intent: "command",
+        command: "./gradlew test",
+        reason: "wrong"
+      }))
+    };
+
+    const message = "启动服务并完成测试";
+    const result = await classifyChatIntent({
+      provider,
+      model: "test",
+      message,
+      history: [],
+      context: { root: "/tmp", fileTree: [], importantFiles: [] }
+    });
+
+    expect(result).toEqual({
+      intent: "task_goal",
+      task: message,
+      reason: "The user described a multi-step execution or verification goal that should be planned, tracked, and resumable."
+    });
+    expect(provider.generateText).not.toHaveBeenCalled();
+  });
+
+  it("keeps explicit one-shot test commands on the command short path", async () => {
+    const provider: LlmProvider = {
+      generateText: vi.fn(async () => JSON.stringify({
+        intent: "command",
+        command: "pnpm test",
+        reason: "run tests"
+      }))
+    };
+
+    const result = await classifyChatIntent({
+      provider,
+      model: "test",
+      message: "运行 pnpm test",
+      history: [],
+      context: { root: "/tmp", fileTree: [], importantFiles: [] }
+    });
+
+    expect(result).toEqual({ intent: "command", command: "pnpm test", reason: "run tests" });
+    expect(provider.generateText).toHaveBeenCalled();
   });
 
   it("returns answer intent on parse failure with fallback", async () => {

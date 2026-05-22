@@ -1,0 +1,190 @@
+import fs from "fs-extra";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { executeTask, resolveResumeStepIndex } from "../src/agent/task-executor.js";
+import { createTaskStore } from "../src/state/task-store.js";
+import type { LlmProvider } from "../src/llm/provider.js";
+import type { RuntimeConfig, TaskPlan, TaskState } from "../src/types.js";
+import { generateCodeActionPlan } from "../src/agent/actions.js";
+
+vi.mock("../src/project/context.js", () => ({
+  collectProjectContext: vi.fn().mockResolvedValue({
+    root: "/tmp/test",
+    fileTree: [],
+    importantFiles: []
+  })
+}));
+
+vi.mock("../src/agent/actions.js", async () => {
+  const actual = await vi.importActual<typeof import("../src/agent/actions.js")>("../src/agent/actions.js");
+  return {
+    ...actual,
+    generateCodeActionPlan: vi.fn().mockResolvedValue({
+      summary: "Run Gradle tests",
+      files: [],
+      commands: [{ command: "./gradlew test", reason: "Verify project" }]
+    }),
+    generateEnvironmentFix: vi.fn().mockResolvedValue(null),
+    applyFileActions: vi.fn().mockResolvedValue(undefined)
+  };
+});
+
+vi.mock("../src/tools/run-command.js", () => ({
+  runValidationCommand: vi.fn().mockImplementation(async (_root: string, command: string) => ({
+    command,
+    exitCode: 127,
+    stdout: "",
+    stderr: "/bin/sh: ./gradlew: No such file or directory",
+    durationMs: 12
+  }))
+}));
+
+function makeConfig(): RuntimeConfig {
+  return {
+    provider: "deepseek",
+    apiKey: "test",
+    model: "test-model",
+    autoApply: true,
+    maxRepairAttempts: 1,
+    validationCommands: [],
+    ignore: []
+  };
+}
+
+function makeState(taskId: string, status: TaskState["status"] = "ready"): TaskState {
+  return {
+    taskId,
+    status,
+    currentStepIndex: 0,
+    completedSteps: [],
+    knownFailures: [],
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+}
+
+const provider: LlmProvider = {
+  async generateText() {
+    return "summary";
+  }
+};
+
+describe("task executor state machine", () => {
+  let root: string | undefined;
+
+  afterEach(async () => {
+    if (root) await fs.remove(root);
+    root = undefined;
+    vi.clearAllMocks();
+  });
+
+  it("blocks on missing environment tools without completing the step", async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-task-executor-"));
+    const store = await createTaskStore(root, "启动服务并完成测试");
+    const plan: TaskPlan = {
+      goal: "启动服务并完成测试",
+      steps: [{
+        id: "1",
+        title: "Run tests",
+        description: "Run Gradle tests",
+        expectedFiles: [],
+        verification: "./gradlew test",
+        milestone: false
+      }]
+    };
+    const state = makeState(store.taskId);
+    await store.writePlan(plan);
+    await store.writeState(state);
+
+    const events = [];
+    for await (const event of executeTask({ root, config: makeConfig(), provider, plan, state, store })) {
+      events.push(event.kind);
+    }
+
+    const saved = await store.readState();
+    expect(events).toContain("step_environment_issue");
+    expect(events).toContain("paused");
+    expect(saved?.status).toBe("blocked");
+    expect(saved?.currentStepIndex).toBe(0);
+    expect(saved?.completedSteps).toHaveLength(0);
+    expect(saved?.blockedReason).toContain("local development environment");
+    expect(saved?.lastFailure?.command).toBe("./gradlew test");
+    expect(saved?.lastFailure?.exitCode).toBe(127);
+  });
+
+  it("does not generate files for operational verification steps even when planner lists expected files", async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-task-executor-"));
+    const store = await createTaskStore(root, "启动服务并完成测试");
+    const plan: TaskPlan = {
+      goal: "启动服务并完成测试",
+      steps: [{
+        id: "1",
+        title: "构建项目",
+        description: "运行构建验证项目是否可编译",
+        expectedFiles: ["build.gradle.kts", "src/main/kotlin/com/example/demo/DemoApplication.kt"],
+        verification: "./gradlew build -x test",
+        milestone: false
+      }]
+    };
+    const state = makeState(store.taskId);
+    await store.writePlan(plan);
+    await store.writeState(state);
+
+    const events = [];
+    for await (const event of executeTask({ root, config: makeConfig(), provider, plan, state, store })) {
+      events.push(event.kind);
+    }
+
+    const saved = await store.readState();
+    expect(generateCodeActionPlan).not.toHaveBeenCalled();
+    expect(events).not.toContain("step_files_written");
+    expect(saved?.completedSteps).toHaveLength(0);
+    expect(saved?.lastFailure?.command).toBe("./gradlew build -x test");
+  });
+
+  it("resumes blocked tasks from the failed step, not the next step", () => {
+    const plan: TaskPlan = {
+      goal: "verify",
+      steps: [
+        { id: "1", title: "Build", description: "Build", expectedFiles: [], verification: "pnpm build" },
+        { id: "2", title: "Test", description: "Test", expectedFiles: [], verification: "pnpm test" }
+      ]
+    };
+    const state = makeState("t1", "blocked");
+    state.currentStepIndex = 0;
+    state.lastFailure = {
+      stepId: "1",
+      stepIndex: 0,
+      command: "pnpm build",
+      exitCode: 1,
+      summary: "Build failed",
+      details: ["pnpm build exited 1"],
+      suggestions: ["Fix build"],
+      nextAction: "Fix build and resume",
+      occurredAt: new Date().toISOString()
+    };
+
+    expect(resolveResumeStepIndex(plan, state)).toBe(0);
+  });
+
+  it("resumes after a completed milestone by advancing to the next incomplete step", () => {
+    const plan: TaskPlan = {
+      goal: "feature",
+      steps: [
+        { id: "1", title: "Auth", description: "Auth", expectedFiles: [], verification: "pnpm build", milestone: true },
+        { id: "2", title: "Tests", description: "Tests", expectedFiles: [], verification: "pnpm test" }
+      ]
+    };
+    const state = makeState("t1", "paused");
+    state.completedSteps.push({
+      stepId: "1",
+      title: "Auth",
+      summary: "Auth done",
+      filesChanged: ["src/auth.ts"],
+      verificationResult: "passed"
+    });
+
+    expect(resolveResumeStepIndex(plan, state)).toBe(1);
+  });
+});

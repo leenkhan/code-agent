@@ -57,6 +57,58 @@ export type ProjectContext = {
   gitStatus?: string;
   gitDiff?: string;
   task?: string;
+  profile?: ProjectProfile;
+};
+
+export type ProjectLanguage =
+  | "typescript"
+  | "javascript"
+  | "python"
+  | "go"
+  | "rust"
+  | "java"
+  | "kotlin"
+  | "swift"
+  | "php"
+  | "ruby"
+  | "csharp";
+
+export type ToolchainCapability = "build" | "test" | "run" | "lint" | "install";
+
+export type ToolchainWrapper = {
+  type: "maven" | "gradle" | "npm" | "pnpm" | "yarn" | "bundle" | "dotnet" | "cargo" | "composer" | "swiftpm" | "python" | "go";
+  command: string;
+  requiredFiles: string[];
+  missingCommand?: string;
+};
+
+export type ValidationStepType = "build" | "test" | "lint" | "run" | "install" | "verify" | "diagnostic" | "unknown";
+
+export type ToolchainAdapter = {
+  language: ProjectLanguage;
+  displayName: string;
+  rootMarkers: string[];
+  importantFiles: string[];
+  sourceGlobs: string[];
+  capabilities: ToolchainCapability[];
+  validationCommands: Partial<Record<ValidationStepType, string[]>>;
+  wrappers: ToolchainWrapper[];
+  longRunningCommandPatterns: string[];
+  environmentChecks: string[];
+  preferredTestCommands?: string[];
+};
+
+export type ProjectProfile = {
+  primaryLanguage?: ProjectLanguage;
+  languages: ProjectLanguage[];
+  adapters: ToolchainAdapter[];
+  rootMarkers: string[];
+  importantFiles: string[];
+  recommendedValidationCommands: string[];
+  wrapperCommands: string[];
+  longRunningPatterns: string[];
+  environmentChecks: string[];
+  notes: string[];
 };
 
 export type ValidationResult = {
@@ -75,4 +127,54 @@ export type RunResult = {
   patchApplied: boolean;
   validationPassed: boolean;
   repairAttempts: number;
+};
+
+export type TaskStep = {
+  id: string;
+  title: string;
+  description: string;
+  expectedFiles: string[];
+  verification: string;
+  milestone?: boolean;
+  dependsOn?: string[];
+};
+
+export type TaskPlan = {
+  goal: string;
+  steps: TaskStep[];
+};
+
+export type StepResult = {
+  stepId: string;
+  title: string;
+  summary: string;
+  filesChanged: string[];
+  verificationResult: "passed" | "failed" | "skipped";
+  semanticWarnings?: string[];
+};
+
+export type TaskFailure = {
+  stepId: string;
+  stepIndex: number;
+  command?: string;
+  exitCode?: number;
+  stdout?: string;
+  stderr?: string;
+  summary: string;
+  details: string[];
+  suggestions: string[];
+  nextAction: string;
+  occurredAt: string;
+};
+
+export type TaskState = {
+  taskId: string;
+  status: "planning" | "ready" | "running" | "paused" | "blocked" | "completed" | "failed";
+  currentStepIndex: number;
+  completedSteps: StepResult[];
+  knownFailures: string[];
+  blockedReason?: string;
+  lastFailure?: TaskFailure;
+  createdAt: string;
+  updatedAt: string;
 };

@@ -1,5 +1,6 @@
 import type { RuntimeConfig } from "../types.js";
 import type { LlmProvider } from "./provider.js";
+import { AnthropicCompatibleProvider } from "./anthropic.js";
 import { DeepSeekProvider } from "./deepseek.js";
 import { OpenAiProvider } from "./openai.js";
 
@@ -9,7 +10,19 @@ export function createLlmProvider(config: RuntimeConfig): LlmProvider {
     throw new Error(`Missing ${config.provider} API key. Set ${envName} or run \`code-agent init\`.`);
   }
   if (config.provider === "deepseek") {
+    if (config.baseUrl?.includes("/anthropic")) {
+      return new AnthropicCompatibleProvider(config.apiKey, {
+        baseUrl: config.baseUrl,
+        defaultModel: config.model
+      });
+    }
     return new DeepSeekProvider(config.apiKey, {
+      baseUrl: config.baseUrl,
+      defaultModel: config.model
+    });
+  }
+  if (config.baseUrl?.includes("/anthropic")) {
+    return new AnthropicCompatibleProvider(config.apiKey, {
       baseUrl: config.baseUrl,
       defaultModel: config.model
     });

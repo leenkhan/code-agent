@@ -10,6 +10,11 @@ const intentSchema = z.discriminatedUnion("intent", [
     answer: z.string()
   }),
   z.object({
+    intent: z.literal("task_goal"),
+    task: z.string(),
+    reason: z.string()
+  }),
+  z.object({
     intent: z.literal("code_change"),
     task: z.string(),
     reason: z.string()
@@ -84,6 +89,81 @@ function inferCodeChangeIntent(message: string): ChatIntent | undefined {
   };
 }
 
+function inferTaskGoalIntent(message: string): ChatIntent | undefined {
+  const normalized = message.toLowerCase();
+  const goalKeywords = [
+    "完成",
+    "验证",
+    "测试链路",
+    "跑通",
+    "启动服务",
+    "运行服务",
+    "启动并测试",
+    "运行并测试",
+    "修复后验证",
+    "complete",
+    "verify",
+    "validate",
+    "run and test",
+    "start service",
+    "start the service",
+    "run the service",
+    "after fixing",
+    "end-to-end",
+    "e2e"
+  ];
+  const strongCompositeGoals = [
+    "启动服务并完成测试",
+    "启动并测试",
+    "运行并测试",
+    "修复后验证",
+    "完成测试链路",
+    "run and test",
+    "start service and test",
+    "start the service and test",
+    "after fixing"
+  ];
+  const executionKeywords = [
+    "测试",
+    "test",
+    "build",
+    "构建",
+    "curl",
+    "接口",
+    "endpoint",
+    "服务",
+    "service",
+    "验证",
+    "validate",
+    "verify"
+  ];
+  const hasGoal = goalKeywords.some((keyword) => normalized.includes(keyword));
+  if (strongCompositeGoals.some((keyword) => normalized.includes(keyword))) {
+    return {
+      intent: "task_goal",
+      task: message,
+      reason: "The user described a multi-step execution or verification goal that should be planned, tracked, and resumable."
+    };
+  }
+  const executionMatches = executionKeywords.filter((keyword) => normalized.includes(keyword)).length;
+  const hasSequence = [
+    "并",
+    "以及",
+    "然后",
+    "再",
+    "and",
+    "then"
+  ].some((keyword) => normalized.includes(keyword));
+
+  if (!hasGoal || (executionMatches < 2 && !hasSequence)) return undefined;
+
+  return {
+    intent: "task_goal",
+    task: message,
+    reason: "The user described a multi-step execution or verification goal that should be planned, tracked, and resumable."
+  };
+}
+
 export async function classifyChatIntent(input: {
   provider: LlmProvider;
   model: string;
@@ -94,6 +174,8 @@ export async function classifyChatIntent(input: {
 }): Promise<ChatIntent> {
   const inferred = inferCodeChangeIntent(input.message);
   if (inferred) return inferred;
+  const taskGoal = inferTaskGoalIntent(input.message);
+  if (taskGoal) return taskGoal;
 
   const response = await input.provider.generateText({
     model: input.model,
@@ -103,11 +185,13 @@ Return only strict JSON. Do not include markdown.
 
 Choose exactly one intent:
 - answer: The user is asking a question, brainstorming, requesting an explanation, or chatting. No file changes or command execution should happen.
+- task_goal: The user describes a multi-step operational goal that must be planned, tracked, verified, and resumable, such as starting a service and testing it, running a build/test/curl validation chain, or validating after a fix.
 - code_change: The user wants files edited, code written, bugs fixed, tests added, docs changed, formatting changed, or implementation work done.
-- command: The user wants a shell/project command run, such as tests, build, lint, doctor, status, or diagnostics.
+- command: The user wants one explicit shell/project command run, such as "run pnpm test", "git status", "doctor", or one clear diagnostics command.
 
 For code_change, produce a concise task that can be passed to the patch workflow.
-For command, produce one safe command string. Prefer validation commands like pnpm test, pnpm build, pnpm lint, npm test, npm run build, npm run lint, npx tsc --noEmit.
+For task_goal, preserve the full user goal so the task runtime can decompose it into steps.
+For command, produce one safe command string. Prefer command only for explicit one-shot requests. Prefer validation commands like pnpm test, pnpm build, pnpm lint, npm test, npm run build, npm run lint, npx tsc --noEmit.
 If the user wants to stop a currently running background command, return command intent with exactly:
 - code-agent stop-background <id>
 Use the running command id from the runtime context. If the user wants to stop all background commands, return:
@@ -135,6 +219,7 @@ ${input.message}
 
 Return JSON matching one of:
 {"intent":"answer","answer":"..."}
+{"intent":"task_goal","task":"...","reason":"..."}
 {"intent":"code_change","task":"...","reason":"..."}
 {"intent":"command","command":"...","reason":"..."}`
   });

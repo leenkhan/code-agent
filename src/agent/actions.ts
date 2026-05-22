@@ -78,20 +78,35 @@ function parseFileContent(text: string): FileAction {
 
 function shouldGenerateInChunks(task: string): boolean {
   const normalized = task.toLowerCase();
-  return [
+  const scaffoldKeywords = [
     "create a",
     "create an",
     "new project",
     "scaffold",
-    "spring boot",
-    "springboot",
-    "backend service",
-    "后端",
-    "服务框架",
     "创建",
     "项目",
     "框架"
-  ].some((keyword) => normalized.includes(keyword));
+  ];
+  const largeProjectKeywords = [
+    "spring",
+    "backend service",
+    "后端",
+    "服务框架",
+    "kotlin",
+    "java ",
+    "认证",
+    "登录",
+    "注册",
+    "auth service",
+    "service framework",
+    "sqlite",
+    "sqllit",
+    "database",
+    "框架",
+    "api"
+  ];
+  return scaffoldKeywords.some((keyword) => normalized.includes(keyword))
+    && largeProjectKeywords.some((keyword) => normalized.includes(keyword));
 }
 
 export async function generateCodeActionPlan(input: {
@@ -183,34 +198,74 @@ Return JSON:
   input.onProgress?.("Generating file actions: parsing file list");
   const manifest = parseCodeActionManifest(manifestResponse);
   const files: FileAction[] = [];
-  for (const [index, file] of manifest.files.entries()) {
-    input.onProgress?.(`Generating file actions: file ${index + 1}/${manifest.files.length} ${file.path}`);
-    const fileResponse = await input.provider.generateText({
+
+  const batchSize = 5;
+  for (let batchStart = 0; batchStart < manifest.files.length; batchStart += batchSize) {
+    const batch = manifest.files.slice(batchStart, batchStart + batchSize);
+    const batchEnd = Math.min(batchStart + batchSize, manifest.files.length);
+    input.onProgress?.(`Generating file actions: files ${batchStart + 1}-${batchEnd}/${manifest.files.length}`);
+
+    const batchResponse = await input.provider.generateText({
       model: input.model,
       responseFormat: "json_object",
-      system: `You generate one complete file for a local code project.
+      system: `You generate complete source files for a local code project.
 Return only strict JSON. Do not include markdown fences.
-The content must be complete for this single file.`,
+All file contents must be complete and correct.
+Maintain consistency across files (imports, references, types).`,
       prompt: `Overall task:
 ${input.task}
 
 Project context:
 ${renderContext(input.context)}
 
-File to generate:
-${JSON.stringify(file, null, 2)}
+Files to generate (batch ${Math.floor(batchStart / batchSize) + 1}):
+${JSON.stringify(batch, null, 2)}
 
-Other files in this plan:
+All files in this plan:
 ${JSON.stringify(manifest.files, null, 2)}
 
 Return JSON:
 {
-  "path": "${file.path}",
-  "content": "complete file content"
+  "files": [
+    {"path": "relative/path", "content": "complete file content"}
+  ]
 }`
     });
-    input.onProgress?.(`Generating file actions: parsing ${file.path}`);
-    files.push(parseFileContent(fileResponse));
+
+    let batchData: { files: FileAction[] };
+    try {
+      const parsed = JSON.parse(extractJson(batchResponse)) as { files?: FileAction[] };
+      if (parsed.files?.length && parsed.files.every((file) => typeof file.path === "string" && typeof file.content === "string")) {
+        batchData = { files: parsed.files };
+      } else if (Array.isArray(parsed)) {
+        batchData = { files: parsed as FileAction[] };
+      } else {
+        // fallback: try parsing as individual file
+        const single = parseFileContent(batchResponse);
+        files.push(single);
+        continue;
+      }
+    } catch {
+      // fallback: generate individually for this batch
+      for (const file of batch) {
+        try {
+          const fileResponse = await input.provider.generateText({
+            model: input.model,
+            responseFormat: "json_object",
+            system: `You generate one complete file. Return only strict JSON: {"path":"...","content":"..."}`,
+            prompt: `Task: ${input.task}\nFile to generate:\n${JSON.stringify(file, null, 2)}`
+          });
+          files.push(parseFileContent(fileResponse));
+        } catch {
+          // skip files that fail to generate
+        }
+      }
+      continue;
+    }
+
+    for (const f of batchData.files) {
+      files.push(f);
+    }
   }
   input.onProgress?.("Generating file actions: assembling plan");
   return {
@@ -310,4 +365,77 @@ export function formatCodeActionPlan(plan: CodeActionPlan): string {
     "Suggested commands:",
     commandLines
   ].join("\n");
+}
+
+const envFixFilesSchema = z.object({
+  files: z.array(z.object({
+    path: z.string().min(1),
+    content: z.string()
+  })).default([]),
+  commands: z.array(z.object({
+    command: z.string().min(1),
+    reason: z.string().default("")
+  })).default([])
+});
+
+export async function generateEnvironmentFix(input: {
+  provider: LlmProvider;
+  model: string;
+  issue: { summary: string; details: string[]; suggestions: string[] };
+  context: ProjectContext;
+  failedCommand: string;
+}): Promise<{ files: FileAction[]; commands: Array<{ command: string; reason: string }> } | null> {
+  try {
+    const response = await input.provider.generateText({
+      model: input.model,
+      responseFormat: "json_object",
+      system: `You fix missing development environment files for a local project.
+The user's project is missing a tool, wrapper script, or configuration file needed to run a command.
+Your job: generate the missing files so the command can succeed.
+Return only strict JSON. Do not include markdown fences.
+
+Examples of what to generate:
+- Gradle wrapper files: gradlew, gradlew.bat, gradle/wrapper/gradle-wrapper.properties
+- Maven wrapper: mvnw, mvnw.cmd, .mvn/wrapper/maven-wrapper.properties
+- Missing config files: application.properties, .env.example
+- Package manager files: package.json with required scripts
+
+Only generate files that are safe and appropriate for a development environment.
+Do NOT generate binaries (.jar, .exe). For binary wrappers, generate shell scripts that download the binary.`,
+      prompt: `The project failed to run this command:
+$ ${input.failedCommand}
+
+The failure was diagnosed as an environment issue:
+${input.issue.summary}
+
+Details:
+${input.issue.details.map((d) => `- ${d}`).join("\n")}
+
+Suggestions:
+${input.issue.suggestions.map((s) => `- ${s}`).join("\n")}
+
+Project context:
+${renderContext(input.context)}
+
+Generate the missing files and any safe setup commands needed. Return JSON:
+{
+  "files": [
+    {"path": "relative/path", "content": "complete file content"}
+  ],
+  "commands": [
+    {"command": "safe setup command (e.g. chmod +x gradlew)", "reason": "why this command is needed"}
+  ]
+}
+
+If you cannot fix this automatically, return: {"files": [], "commands": []}`
+    });
+
+    const parsed = envFixFilesSchema.safeParse(JSON.parse(extractJson(response)) as unknown);
+    if (!parsed.success || (parsed.data.files.length === 0 && parsed.data.commands.length === 0)) {
+      return null;
+    }
+    return parsed.data;
+  } catch {
+    return null;
+  }
 }
