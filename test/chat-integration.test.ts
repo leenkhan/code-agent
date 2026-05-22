@@ -68,16 +68,37 @@ const repairPlan = makeCodePlan({
   "src/math.ts": mathTs
 }, "Fix type errors: add missing parameter types");
 
+const kotlinBuildGradle = [
+  "plugins {",
+  "    kotlin(\"jvm\") version \"1.9.25\"",
+  "    kotlin(\"plugin.spring\") version \"1.9.25\"",
+  "    id(\"org.springframework.boot\") version \"3.3.5\"",
+  "    id(\"io.spring.dependency-management\") version \"1.1.6\"",
+  "}",
+  "",
+  "repositories { mavenCentral() }"
+].join("\n");
+
+const kotlinManifestPlan = JSON.stringify({
+  summary: "Scaffold Kotlin Spring Boot project with SQLite auth service",
+  files: [{ path: "build.gradle.kts", purpose: "Gradle Kotlin build file" }],
+  commands: []
+});
+
 const { mockState } = vi.hoisted(() => ({
-  mockState: { inputIndex: 0, userMessages: [] as string[] }
+  mockState: {
+    inputIndex: 0,
+    userMessages: [] as string[],
+    inputs: [
+      "帮我创建一个 TypeScript 数学工具库项目，要包含加减乘除四个函数，以及完整的单元测试",
+      "/exit"
+    ] as string[]
+  }
 }));
 
 vi.mock("@inquirer/prompts", () => ({
   input: vi.fn().mockImplementation(async () => {
-    const inputs = [
-      "帮我创建一个 TypeScript 数学工具库项目，要包含加减乘除四个函数，以及完整的单元测试",
-      "/exit"
-    ];
+    const inputs = mockState.inputs;
     const value = inputs[mockState.inputIndex] ?? "/exit";
     if (mockState.inputIndex < inputs.length) mockState.inputIndex += 1;
     mockState.userMessages.push(value);
@@ -119,6 +140,27 @@ function makeSuccessProvider(): LlmProvider {
   };
 }
 
+function makeKotlinProviderThatMisclassifiesCreation(): LlmProvider {
+  return {
+    async generateText(input) {
+      if (input.responseFormat === "json_object" && input.prompt.includes("User message:")) {
+        return JSON.stringify({
+          intent: "command",
+          command: "./gradlew bootRun",
+          reason: "Start app"
+        });
+      }
+      if (input.responseFormat === "json_object" && input.prompt.includes("File to generate:")) {
+        return JSON.stringify({ path: "build.gradle.kts", content: kotlinBuildGradle });
+      }
+      if (input.responseFormat === "json_object" && input.prompt.includes("Return JSON:")) {
+        return kotlinManifestPlan;
+      }
+      return JSON.stringify({ intent: "answer", answer: "done" });
+    }
+  };
+}
+
 function makeRepairProvider(brokenResponse: string, fixedResponse: string, returnFixedAfterCalls: number): LlmProvider {
   let calls = 0;
   return {
@@ -148,6 +190,10 @@ function makeRepairProvider(brokenResponse: string, fixedResponse: string, retur
 function resetMockState() {
   mockState.inputIndex = 0;
   mockState.userMessages = [];
+  mockState.inputs = [
+    "帮我创建一个 TypeScript 数学工具库项目，要包含加减乘除四个函数，以及完整的单元测试",
+    "/exit"
+  ];
 }
 
 describe("chat integration: full code generation flow", () => {
@@ -191,6 +237,28 @@ describe("chat integration: full code generation flow", () => {
     const tscResult = await execa("npx", ["tsc", "--noEmit"], { cwd: root, reject: false });
     expect(tscResult.exitCode).toBe(0);
   }, 30000);
+});
+
+describe("chat integration: Kotlin Spring Boot creation intent", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.clearAllMocks();
+    resetMockState();
+  });
+
+  it("routes create-and-run requests to file generation even if the model would suggest bootRun", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-chat-kotlin-"));
+    vi.stubEnv("DEEPSEEK_API_KEY", "test-key");
+    mockState.inputs = [
+      "我想创建一个基于Kotlin, springboo + sqllit的项目，先实现一个用email登录、注册的后端服务框架，运行服务并测试",
+      "/exit"
+    ];
+    vi.mocked(createLlmProvider).mockReturnValue(makeKotlinProviderThatMisclassifiesCreation());
+
+    await chatCommand(root, { autoApply: true, model: "deepseek-v4-pro" });
+
+    await expect(fs.readFile(path.join(root, "build.gradle.kts"), "utf8")).resolves.toBe(kotlinBuildGradle);
+  });
 });
 
 describe("chat integration: repair loop on broken code", () => {
@@ -439,4 +507,3 @@ describe("chat integration: Go repair loop on broken code", () => {
     expect(testResult.exitCode).not.toBe(0);
   }, 30000);
 });
-

@@ -43,6 +43,7 @@ export type FileAction = z.infer<typeof fileActionSchema>;
 export type CommandAction = z.infer<typeof commandActionSchema>;
 export type CodeActionPlan = z.infer<typeof codeActionPlanSchema>;
 type CodeActionManifest = z.infer<typeof codeActionManifestSchema>;
+type ProgressUpdate = (message: string) => void;
 
 
 export function parseCodeActionPlan(text: string): CodeActionPlan {
@@ -75,13 +76,37 @@ function parseFileContent(text: string): FileAction {
   return parsed.data;
 }
 
+function shouldGenerateInChunks(task: string): boolean {
+  const normalized = task.toLowerCase();
+  return [
+    "create a",
+    "create an",
+    "new project",
+    "scaffold",
+    "spring boot",
+    "springboot",
+    "backend service",
+    "后端",
+    "服务框架",
+    "创建",
+    "项目",
+    "框架"
+  ].some((keyword) => normalized.includes(keyword));
+}
+
 export async function generateCodeActionPlan(input: {
   provider: LlmProvider;
   model: string;
   task: string;
   context: ProjectContext;
+  onProgress?: ProgressUpdate;
 }): Promise<CodeActionPlan> {
+  if (shouldGenerateInChunks(input.task)) {
+    return generateCodeActionPlanInChunks(input, "Large scaffold request; generating a manifest first to keep progress visible and avoid oversized JSON.");
+  }
+
   try {
+    input.onProgress?.("Generating file actions: drafting complete plan");
     const response = await input.provider.generateText({
       model: input.model,
       responseFormat: "json_object",
@@ -118,6 +143,7 @@ Return JSON with this exact shape:
   ]
 }`
     });
+    input.onProgress?.("Generating file actions: parsing complete plan");
     return parseCodeActionPlan(response);
   } catch (error) {
     return generateCodeActionPlanInChunks(input, error instanceof Error ? error.message : String(error));
@@ -129,7 +155,9 @@ async function generateCodeActionPlanInChunks(input: {
   model: string;
   task: string;
   context: ProjectContext;
+  onProgress?: ProgressUpdate;
 }, reason: string): Promise<CodeActionPlan> {
+  input.onProgress?.("Generating file actions: planning file list");
   const manifestResponse = await input.provider.generateText({
     model: input.model,
     responseFormat: "json_object",
@@ -152,9 +180,11 @@ Return JSON:
   "commands": [{"command": "safe local command", "reason": "why"}]
 }`
   });
+  input.onProgress?.("Generating file actions: parsing file list");
   const manifest = parseCodeActionManifest(manifestResponse);
   const files: FileAction[] = [];
-  for (const file of manifest.files) {
+  for (const [index, file] of manifest.files.entries()) {
+    input.onProgress?.(`Generating file actions: file ${index + 1}/${manifest.files.length} ${file.path}`);
     const fileResponse = await input.provider.generateText({
       model: input.model,
       responseFormat: "json_object",
@@ -179,8 +209,10 @@ Return JSON:
   "content": "complete file content"
 }`
     });
+    input.onProgress?.(`Generating file actions: parsing ${file.path}`);
     files.push(parseFileContent(fileResponse));
   }
+  input.onProgress?.("Generating file actions: assembling plan");
   return {
     summary: manifest.summary,
     files,

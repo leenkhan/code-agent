@@ -108,22 +108,156 @@ function shouldRegenerateContextualReply(message: string, answer: string): boole
   ].some((keyword) => normalized.includes(keyword));
 }
 
+function isCreateOrScaffoldTask(task: string): boolean {
+  const normalized = task.toLowerCase();
+  return [
+    "创建",
+    "新建",
+    "搭建",
+    "生成",
+    "create",
+    "new project",
+    "scaffold",
+    "set up",
+    "setup"
+  ].some((keyword) => normalized.includes(keyword));
+}
+
+export function inspectExistingProject(context: import("../types.js").ProjectContext): ExistingProjectState | undefined {
+  const markerPatterns = [
+    /^package\.json$/,
+    /^pnpm-lock\.yaml$/,
+    /^pom\.xml$/,
+    /^build\.gradle(\.kts)?$/,
+    /^settings\.gradle(\.kts)?$/,
+    /^gradlew(\.bat)?$/,
+    /^go\.mod$/,
+    /^Cargo\.toml$/,
+    /^pyproject\.toml$/,
+    /^requirements\.txt$/,
+    /^src\//
+  ];
+  const sourcePatterns = [
+    /^src\//,
+    /\.(ts|tsx|js|jsx|kt|java|py|go|rs)$/i
+  ];
+  const markers = context.fileTree.filter((file) => markerPatterns.some((pattern) => pattern.test(file))).slice(0, 12);
+  const sourceFiles = context.fileTree.filter((file) => sourcePatterns.some((pattern) => pattern.test(file))).slice(0, 12);
+  if (markers.length === 0 && sourceFiles.length === 0) return undefined;
+  return { markers, sourceFiles };
+}
+
+export function formatExistingProjectState(state: ExistingProjectState): string {
+  const lines = ["Existing project files detected before scaffolding."];
+  if (state.markers.length > 0) {
+    lines.push("", "Project markers:", ...state.markers.map((file) => `- ${file}`));
+  }
+  if (state.sourceFiles.length > 0) {
+    lines.push("", "Source files:", ...state.sourceFiles.map((file) => `- ${file}`));
+  }
+  return lines.join("\n");
+}
+
 function formatElapsed(ms: number): string {
   if (ms < 1000) return `${ms}ms`;
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
-async function withProgress<T>(message: string, task: () => Promise<T>): Promise<T> {
+type ProgressUpdate = (message: string) => void;
+type EnvironmentIssue = {
+  summary: string;
+  details: string[];
+  suggestions: string[];
+};
+type ExistingProjectState = {
+  markers: string[];
+  sourceFiles: string[];
+};
+
+async function withProgress<T>(message: string, task: (update: ProgressUpdate) => Promise<T>): Promise<T> {
   const started = Date.now();
+  let currentMessage = message;
   const spinner = ora(message).start();
+  const timer = setInterval(() => {
+    spinner.text = `${currentMessage} (${formatElapsed(Date.now() - started)})`;
+  }, 1000);
+  const update: ProgressUpdate = (nextMessage) => {
+    currentMessage = nextMessage;
+    spinner.text = `${currentMessage} (${formatElapsed(Date.now() - started)})`;
+  };
   try {
-    const result = await task();
-    spinner.succeed(`${message} (${formatElapsed(Date.now() - started)})`);
+    const result = await task(update);
+    spinner.succeed(`${currentMessage} (${formatElapsed(Date.now() - started)})`);
     return result;
   } catch (error) {
-    spinner.fail(`${message} failed (${formatElapsed(Date.now() - started)})`);
+    spinner.fail(`${currentMessage} failed (${formatElapsed(Date.now() - started)})`);
     throw error;
+  } finally {
+    clearInterval(timer);
   }
+}
+
+export function analyzeEnvironmentFailures(results: ValidationResult[]): EnvironmentIssue | undefined {
+  const details: string[] = [];
+  const suggestions = new Set<string>();
+
+  for (const result of results.filter((item) => item.exitCode !== 0)) {
+    const output = `${result.stderr}\n${result.stdout}`;
+    const lower = output.toLowerCase();
+    const command = result.command;
+
+    if (/\.\/gradlew.*no such file or directory/i.test(output) || (command.includes("./gradlew") && lower.includes("no such file or directory"))) {
+      details.push(`Gradle wrapper is missing for "${command}".`);
+      suggestions.add("Generate the Gradle wrapper after installing Gradle, or provide wrapper files in the project.");
+      suggestions.add("Skip service startup and curl tests until `./gradlew build` succeeds.");
+      continue;
+    }
+
+    const missingCommand = output.match(/(?:^|\n)\/bin\/sh:\s*(?:line \d+:\s*)?([^:\n]+): command not found/i);
+    if (result.exitCode === 127 || missingCommand) {
+      const tool = missingCommand?.[1]?.trim() || command.split(/\s+/)[0] || "required tool";
+      details.push(`Missing command while running "${command}": ${tool}`);
+      if (tool.includes("gradle")) {
+        suggestions.add("Install Gradle first, or use an environment that already has Gradle available before running `gradle wrapper`.");
+        suggestions.add("After Gradle is available, rerun the wrapper/build commands.");
+      } else {
+        suggestions.add(`Install or add "${tool}" to PATH, then rerun the command.`);
+      }
+      continue;
+    }
+
+    if (/curl:\s*\(7\).*failed to connect/i.test(output) || lower.includes("couldn't connect to server")) {
+      details.push(`Service was not reachable while running "${command}".`);
+      suggestions.add("Start the service successfully before running curl endpoint tests.");
+      suggestions.add("Check the earlier build/start command output first; curl failures after a start failure are usually downstream environment failures.");
+      continue;
+    }
+
+    if (lower.includes("enotfound") || lower.includes("could not resolve host") || lower.includes("network connectivity")) {
+      details.push(`Network access failed while running "${command}".`);
+      suggestions.add("Check registry/network/proxy access, then rerun the command.");
+      continue;
+    }
+  }
+
+  if (details.length === 0) return undefined;
+  return {
+    summary: "Validation stopped because the local development environment is missing required tools or services.",
+    details,
+    suggestions: [...suggestions]
+  };
+}
+
+export function formatEnvironmentIssue(issue: EnvironmentIssue): string {
+  return [
+    issue.summary,
+    "",
+    "Details:",
+    ...issue.details.map((detail) => `- ${detail}`),
+    "",
+    "Suggested next steps:",
+    ...issue.suggestions.map((suggestion) => `- ${suggestion}`)
+  ].join("\n");
 }
 
 async function runInternalServiceCommand(command: string, history: ChatMessage[]): Promise<boolean> {
@@ -200,11 +334,12 @@ async function runRepairLoop(params: {
 
     let repairPlan;
     try {
-      repairPlan = await withProgress(`Generating repair ${attempt + 1}/${config.maxRepairAttempts}`, () => generateCodeActionPlan({
-        provider,
-        model: config.model,
-        task: `Fix the following validation errors from the previous code change.\nOriginal task: ${task}\n\nCommand errors:\n${errorSummary}\n\nRead the current file contents and produce corrected versions.`,
-        context: repairContext
+      repairPlan = await withProgress(`Generating repair ${attempt + 1}/${config.maxRepairAttempts}`, (update) => generateCodeActionPlan({
+          provider,
+          model: config.model,
+          task: `Fix the following validation errors from the previous code change.\nOriginal task: ${task}\n\nCommand errors:\n${errorSummary}\n\nRead the current file contents and produce corrected versions.`,
+        context: repairContext,
+        onProgress: (message) => update(message.replace("Generating file actions", `Generating repair ${attempt + 1}/${config.maxRepairAttempts}`))
       }));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -371,13 +506,28 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
       }
 
       const actionContext = await withProgress("Refreshing project context", () => collectProjectContext(root, config, intent.task));
+      const existingProject = isCreateOrScaffoldTask(intent.task) ? inspectExistingProject(actionContext) : undefined;
+      if (existingProject) {
+        const message = formatExistingProjectState(existingProject);
+        logger.heading("Existing project detected");
+        logger.info(message);
+        history.push({ role: "assistant", content: message });
+        const shouldAdaptExisting = config.autoApply || await askConfirm("Continue by adapting the existing project instead of creating from an empty directory?", true);
+        if (!shouldAdaptExisting) {
+          logger.info("No code changes made.");
+          history.push({ role: "assistant", content: "用户取消了在已有项目上继续生成代码。" });
+          await store.writeJson("transcript.json", history);
+          continue;
+        }
+      }
       let actionPlan;
       try {
-        actionPlan = await withProgress("Generating file actions", () => generateCodeActionPlan({
+        actionPlan = await withProgress("Generating file actions", (update) => generateCodeActionPlan({
           provider,
           model: config.model,
           task: intent.task,
-          context: actionContext
+          context: actionContext,
+          onProgress: update
         }));
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -409,6 +559,7 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
 
       // Run suggested commands, tracking validation results for auto-repair
       const validationResults: ValidationResult[] = [];
+      let environmentIssue: EnvironmentIssue | undefined;
       for (const cmd of actionPlan.commands) {
         const isInstall = requiresInstallConfirmation(cmd.command);
         const isLongRunning = isLongRunningCommand(cmd.command);
@@ -425,11 +576,22 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
             logger.heading("Command result");
             logger.info(output);
             history.push({ role: "assistant", content: output });
+            environmentIssue = analyzeEnvironmentFailures([result]);
+            if (environmentIssue) {
+              const message = formatEnvironmentIssue(environmentIssue);
+              logger.heading("Environment issue");
+              logger.warn(message);
+              history.push({ role: "assistant", content: message });
+              break;
+            }
           }
         }
       }
 
-      if (validationResults.some((r) => r.exitCode !== 0)) {
+      if (environmentIssue) {
+        logger.info("Auto-repair skipped because this failure is caused by the local environment, not the generated code.");
+        history.push({ role: "assistant", content: "已跳过自动修复：当前失败来自本地开发环境缺失或服务未启动，不是代码补丁可直接修复的问题。" });
+      } else if (validationResults.some((r) => r.exitCode !== 0)) {
         const errorSummary = validationResults
           .filter((r) => r.exitCode !== 0)
           .map((r) => `$ ${r.command}\nexitCode: ${r.exitCode}\n${r.stderr || r.stdout}`)
@@ -468,17 +630,25 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
           history.push({ role: "assistant", content: output });
 
           if (result.exitCode !== 0) {
-            const shouldRepair = await askConfirm("Command failed. Try to fix the code?", true);
-            if (shouldRepair) {
-              const repairTask = `Command "${intent.command}" failed. Fix the code.\n\nError:\n${result.stderr || result.stdout}`;
-              await runRepairLoop({
-                root,
-                config,
-                provider,
-                history,
-                runningCommands,
-                task: repairTask
-              });
+            const environmentIssue = analyzeEnvironmentFailures([result]);
+            if (environmentIssue) {
+              const message = formatEnvironmentIssue(environmentIssue);
+              logger.heading("Environment issue");
+              logger.warn(message);
+              history.push({ role: "assistant", content: message });
+            } else {
+              const shouldRepair = await askConfirm("Command failed. Try to fix the code?", true);
+              if (shouldRepair) {
+                const repairTask = `Command "${intent.command}" failed. Fix the code.\n\nError:\n${result.stderr || result.stdout}`;
+                await runRepairLoop({
+                  root,
+                  config,
+                  provider,
+                  history,
+                  runningCommands,
+                  task: repairTask
+                });
+              }
             }
           }
         }

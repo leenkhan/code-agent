@@ -47,6 +47,32 @@ describe("parseChatIntent", () => {
 });
 
 describe("classifyChatIntent", () => {
+  it("forces project creation requests to code_change before asking the provider", async () => {
+    const provider: LlmProvider = {
+      generateText: vi.fn(async () => JSON.stringify({
+        intent: "command",
+        command: "./gradlew bootRun",
+        reason: "wrong"
+      }))
+    };
+
+    const message = "我想创建一个基于Kotlin, springboo + sqllit的项目，先实现一个用email登录、注册的后端服务框架，运行服务并测试";
+    const result = await classifyChatIntent({
+      provider,
+      model: "test",
+      message,
+      history: [],
+      context: { root: "/tmp", fileTree: [], importantFiles: [] }
+    });
+
+    expect(result).toEqual({
+      intent: "code_change",
+      task: message,
+      reason: "The user asked to create or implement project code; any requested run/test steps should happen after file generation."
+    });
+    expect(provider.generateText).not.toHaveBeenCalled();
+  });
+
   it("returns answer intent on parse failure with fallback", async () => {
     const provider: LlmProvider = {
       async generateText() {

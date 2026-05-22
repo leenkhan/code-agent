@@ -172,7 +172,7 @@ export OPENAI_API_KEY="sk-..."
 
 启动交互式终端对话。直接执行 `code-agent` 时也会进入这个模式。
 
-普通输入会先收集当前项目上下文，再交给模型判断意图，因此可以询问项目结构、文件用途、可能的修改方案、错误原因等。上下文包含文件树、代表性文件内容、Git 状态/差异，以及轻量 AST/LSP-like 信息：TypeScript/JavaScript 会尽量通过 TypeScript Compiler API 提取函数、类、接口、类型、枚举、方法、变量和解析诊断；Python、Go、Rust、Java 等常见语言会用保守的文本规则提取主要符号。
+普通输入会先收集当前项目上下文，再交给模型判断意图，因此可以询问项目结构、文件用途、可能的修改方案、错误原因等。上下文包含文件树、代表性文件内容、Git 状态/差异，以及轻量 AST/LSP-like 信息：TypeScript/JavaScript 会尽量通过 TypeScript Compiler API 提取函数、类、接口、类型、枚举、方法、变量和解析诊断；Python、Go、Rust、Java、Kotlin、Swift、PHP、Ruby、C# 等常见语言会优先通过 Tree-sitter WASM 语法树提取主要符号和解析错误，解析器或语法不可用时会回退到保守的文本规则。
 
 对于"代码审查"、"review 当前项目"、"分析这个项目"这类只读项目分析请求，CLI 会直接基于已收集的文件树和代表性源码内容生成建议，不会要求你手动粘贴代码，也不会进入代码修改确认流程。
 
@@ -367,7 +367,7 @@ node dist/cli.js --help
 - **自动修复闭环**：chat 模式下写入文件后运行验证命令，失败时自动将错误反馈给 LLM 生成修复，循环至成功或达到次数上限。
 - **项目审查体验优化**：chat 模式支持直接输入"代码审查"或"review 当前项目"，自动读取项目上下文并给出只读建议。
 - **进度和耗时提示**：chat 模式的上下文收集、LLM 调用、命令执行和修复流程都会显示实时状态及耗时。
-- **轻量 AST/LSP-like 上下文**：项目上下文新增 `symbols` 和 `diagnostics`，让代码审查、计划、修复更容易看到主要代码结构和语法诊断。
+- **轻量 AST/LSP-like 上下文**：项目上下文新增 `symbols` 和 `diagnostics`，让代码审查、计划、修复更容易看到主要代码结构和语法诊断。符号会标注 `source`/`parser`，用于区分 TypeScript Compiler API、Tree-sitter 和正则回退来源。
 - LLM 调用增加 AbortController 超时取消和指数退避重试。
 - 命令安全检查从子串匹配升级为正则词边界匹配，减少误拦截。
 - 消除 `renderContext` 和 `extractJson` 的重复代码，提取到共享模块。
@@ -376,6 +376,7 @@ node dist/cli.js --help
 
 - 补丁应用依赖 Git：使用 `git apply` 和 `git apply -R`。
 - AST/LSP-like 上下文是轻量本地分析，不启动语言服务器，也不替代完整 IDE/LSP 的跨文件语义能力。
+- Tree-sitter 支持基于本地 WASM 语法包动态加载；如果运行环境无法加载解析器、某个语法版本不兼容，或语言不在当前映射内，CLI 会继续使用原有 TypeScript/正则路径。
 - `plan`、`fix` 需要可用的 API Key。
 - 自动测试不调用真实 LLM，只覆盖安全策略、补丁校验、配置和运行时控制流。
 
@@ -391,7 +392,6 @@ node dist/cli.js --help
 - MCP
 - LangGraph
 - 多 Agent 架构
-- Tree-sitter AST
 - 外部 LSP Server 集成
 - GitHub PR 创建
 - 云端执行

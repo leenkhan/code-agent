@@ -36,6 +36,54 @@ export function parseChatIntent(text: string): ChatIntent {
   return parsed.data;
 }
 
+function inferCodeChangeIntent(message: string): ChatIntent | undefined {
+  const normalized = message.toLowerCase();
+  const asksForCreationOrImplementation = [
+    "创建",
+    "新建",
+    "实现",
+    "搭建",
+    "生成",
+    "写一个",
+    "create",
+    "build",
+    "implement",
+    "scaffold",
+    "set up",
+    "setup"
+  ].some((keyword) => normalized.includes(keyword));
+  if (!asksForCreationOrImplementation) return undefined;
+
+  const targetsProjectOrCode = [
+    "项目",
+    "后端",
+    "服务",
+    "框架",
+    "代码",
+    "接口",
+    "springboot",
+    "spring boot",
+    "kotlin",
+    "sqlite",
+    "sqllit",
+    "backend",
+    "service",
+    "framework",
+    "endpoint",
+    "api",
+    "project",
+    "app",
+    "application"
+  ].some((keyword) => normalized.includes(keyword));
+  if (!targetsProjectOrCode) return undefined;
+
+  return {
+    intent: "code_change",
+    task: message,
+    reason: "The user asked to create or implement project code; any requested run/test steps should happen after file generation."
+  };
+}
+
 export async function classifyChatIntent(input: {
   provider: LlmProvider;
   model: string;
@@ -44,6 +92,9 @@ export async function classifyChatIntent(input: {
   context: ProjectContext;
   runtimeContext?: string;
 }): Promise<ChatIntent> {
+  const inferred = inferCodeChangeIntent(input.message);
+  if (inferred) return inferred;
+
   const response = await input.provider.generateText({
     model: input.model,
     responseFormat: "json_object",

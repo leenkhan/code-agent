@@ -41,6 +41,7 @@ describe("code actions", () => {
 
   it("falls back to manifest and per-file generation when full action generation fails", async () => {
     const calls: string[] = [];
+    const progress: string[] = [];
     const provider: LlmProvider = {
       async generateText(input) {
         calls.push(input.system);
@@ -61,11 +62,55 @@ describe("code actions", () => {
     const plan = await generateCodeActionPlan({
       provider,
       model: "test",
-      task: "create app",
-      context: { root: "/tmp/test", fileTree: [], importantFiles: [] }
+      task: "add one utility file",
+      context: { root: "/tmp/test", fileTree: [], importantFiles: [] },
+      onProgress(message) {
+        progress.push(message);
+      }
     });
 
     expect(plan.files).toEqual([{ path: "main.py", content: "print('ok')\n" }]);
     expect(plan.commands[0]?.command).toBe("python -m py_compile main.py");
+    expect(progress).toEqual([
+      "Generating file actions: drafting complete plan",
+      "Generating file actions: planning file list",
+      "Generating file actions: parsing file list",
+      "Generating file actions: file 1/1 main.py",
+      "Generating file actions: parsing main.py",
+      "Generating file actions: assembling plan"
+    ]);
+  });
+
+  it("uses manifest-first generation for larger project scaffolds", async () => {
+    const calls: string[] = [];
+    const progress: string[] = [];
+    const provider: LlmProvider = {
+      async generateText(input) {
+        calls.push(input.system);
+        if (calls.length === 1) {
+          return JSON.stringify({
+            summary: "Create Kotlin backend",
+            files: [{ path: "build.gradle.kts", purpose: "Gradle build" }],
+            commands: [{ command: "gradle test", reason: "run tests" }]
+          });
+        }
+        return JSON.stringify({ path: "build.gradle.kts", content: "plugins {}\n" });
+      }
+    };
+
+    const plan = await generateCodeActionPlan({
+      provider,
+      model: "test",
+      task: "Create a Kotlin Spring Boot project with SQLite",
+      context: { root: "/tmp/test", fileTree: [], importantFiles: [] },
+      onProgress(message) {
+        progress.push(message);
+      }
+    });
+
+    expect(calls[0]).toContain("compact file manifest");
+    expect(plan.files).toEqual([{ path: "build.gradle.kts", content: "plugins {}\n" }]);
+    expect(progress[0]).toBe("Generating file actions: planning file list");
+    expect(progress).toContain("Generating file actions: file 1/1 build.gradle.kts");
   });
 });

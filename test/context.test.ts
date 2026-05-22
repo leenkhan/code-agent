@@ -65,6 +65,20 @@ describe("collectProjectContext", () => {
     );
   });
 
+  it("uses Tree-sitter for supported non-TypeScript symbols when available", async () => {
+    const root = await makeRoot();
+    await fs.writeFile(path.join(root, "main.go"), "package main\n\nfunc run() {}\ntype User struct{}\n");
+
+    const context = await collectProjectContext(root, config);
+
+    expect(context.symbols).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: "main.go", name: "run", kind: "go-function", source: "tree-sitter", parser: "tree-sitter-go" }),
+        expect.objectContaining({ path: "main.go", name: "User", kind: "go-type", source: "tree-sitter", parser: "tree-sitter-go" })
+      ])
+    );
+  });
+
   it("keeps sensitive files out of text and structured context", async () => {
     const root = await makeRoot();
     await fs.mkdir(path.join(root, "src"), { recursive: true });

@@ -32,6 +32,8 @@ export type CodeSymbol = {
   kind: string;
   line: number;
   column: number;
+  source?: "typescript" | "tree-sitter" | "regex";
+  parser?: string;
   exported?: boolean;
   signature?: string;
 };
@@ -42,6 +44,8 @@ export type CodeDiagnostic = {
   line: number;
   column: number;
   severity: "error" | "warning" | "suggestion" | "message";
+  source?: "typescript" | "tree-sitter";
+  parser?: string;
 };
 
 export type ProjectContext = {

@@ -1,4 +1,5 @@
 import path from "node:path";
+import { createRequire } from "node:module";
 import fg from "fast-glob";
 import ignore from "ignore";
 import fs from "fs-extra";
@@ -27,11 +28,23 @@ const sourceFileGlobs = [
 ];
 
 type TypeScriptModule = typeof import("typescript");
+type TreeSitterParserModule = typeof import("web-tree-sitter");
+
+type TreeSitterNode = import("web-tree-sitter").SyntaxNode;
+type TreeSitterLanguage = import("web-tree-sitter").Language;
+
+type TreeSitterRuntime = {
+  Parser: TreeSitterParserModule;
+  languages: Map<string, TreeSitterLanguage>;
+};
 
 type LoadedTextFile = {
   path: string;
   content: string;
 };
+
+const require = createRequire(import.meta.url);
+let treeSitterRuntimePromise: Promise<TreeSitterRuntime | undefined> | undefined;
 
 async function buildIgnore(root: string, config: ProjectConfig): Promise<ReturnType<typeof ignore>> {
   const ig = ignore().add(config.ignore);
@@ -44,6 +57,20 @@ async function buildIgnore(root: string, config: ProjectConfig): Promise<ReturnT
 
 function isTypeScriptLike(filePath: string): boolean {
   return /\.(ts|tsx|js|jsx|mts|cts)$/i.test(filePath);
+}
+
+function treeSitterLanguageName(filePath: string): string | undefined {
+  const extension = path.extname(filePath).toLowerCase();
+  if (extension === ".py") return "python";
+  if (extension === ".go") return "go";
+  if (extension === ".rs") return "rust";
+  if (extension === ".java") return "java";
+  if (extension === ".kt") return "kotlin";
+  if (extension === ".swift") return "swift";
+  if (extension === ".php") return "php";
+  if (extension === ".rb") return "ruby";
+  if (extension === ".cs") return "c_sharp";
+  return undefined;
 }
 
 function lineColumnFromIndex(content: string, index: number): { line: number; column: number } {
@@ -59,6 +86,34 @@ function trimSignature(text: string): string {
 async function loadTypeScript(): Promise<TypeScriptModule | undefined> {
   try {
     return await import("typescript");
+  } catch {
+    return undefined;
+  }
+}
+
+async function loadTreeSitterRuntime(): Promise<TreeSitterRuntime | undefined> {
+  treeSitterRuntimePromise ??= (async () => {
+    try {
+      const imported = await import("web-tree-sitter");
+      const Parser = (imported.default ?? imported) as TreeSitterParserModule;
+      await Parser.init();
+      return { Parser, languages: new Map() };
+    } catch {
+      return undefined;
+    }
+  })();
+  return treeSitterRuntimePromise;
+}
+
+async function loadTreeSitterLanguage(runtime: TreeSitterRuntime, languageName: string): Promise<TreeSitterLanguage | undefined> {
+  const cached = runtime.languages.get(languageName);
+  if (cached) return cached;
+
+  try {
+    const wasmPath = require.resolve(`tree-sitter-wasms/out/tree-sitter-${languageName}.wasm`);
+    const language = await runtime.Parser.Language.load(wasmPath);
+    runtime.languages.set(languageName, language);
+    return language;
   } catch {
     return undefined;
   }
@@ -106,7 +161,9 @@ function extractTypeScriptContext(ts: TypeScriptModule, file: LoadedTextFile): {
       message: ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n"),
       line: position.line + 1,
       column: position.character + 1,
-      severity: diagnosticSeverity(ts, diagnostic.category)
+      severity: diagnosticSeverity(ts, diagnostic.category),
+      source: "typescript",
+      parser: "typescript"
     };
   });
 
@@ -119,7 +176,9 @@ function extractTypeScriptContext(ts: TypeScriptModule, file: LoadedTextFile): {
       line: position.line + 1,
       column: position.character + 1,
       exported,
-      signature: trimSignature(node.getText(source).split("{", 1)[0] ?? node.getText(source))
+      signature: trimSignature(node.getText(source).split("{", 1)[0] ?? node.getText(source)),
+      source: "typescript",
+      parser: "typescript"
     });
   };
 
@@ -176,6 +235,8 @@ function extractRegexSymbols(file: LoadedTextFile): CodeSymbol[] {
         kind: pattern.kind,
         line: position.line,
         column: position.column,
+        source: "regex",
+        parser: "regex",
         signature: trimSignature(match[0])
       });
     }
@@ -183,8 +244,148 @@ function extractRegexSymbols(file: LoadedTextFile): CodeSymbol[] {
   return symbols;
 }
 
+function treeSitterSymbolKind(languageName: string, nodeType: string): string | undefined {
+  const kindByLanguage: Record<string, Record<string, string>> = {
+    python: {
+      function_definition: "python-function",
+      class_definition: "python-class"
+    },
+    go: {
+      function_declaration: "go-function",
+      method_declaration: "go-method",
+      type_spec: "go-type"
+    },
+    rust: {
+      function_item: "rust-function",
+      struct_item: "rust-struct",
+      enum_item: "rust-enum",
+      trait_item: "rust-trait",
+      impl_item: "rust-impl"
+    },
+    java: {
+      class_declaration: "java-class",
+      interface_declaration: "java-interface",
+      enum_declaration: "java-enum",
+      method_declaration: "java-method",
+      constructor_declaration: "java-constructor"
+    },
+    kotlin: {
+      function_declaration: "kotlin-function",
+      class_declaration: "kotlin-class",
+      object_declaration: "kotlin-object"
+    },
+    swift: {
+      function_declaration: "swift-function",
+      class_declaration: "swift-class",
+      struct_declaration: "swift-struct",
+      protocol_declaration: "swift-protocol",
+      enum_declaration: "swift-enum"
+    },
+    php: {
+      function_definition: "php-function",
+      method_declaration: "php-method",
+      class_declaration: "php-class",
+      interface_declaration: "php-interface",
+      trait_declaration: "php-trait"
+    },
+    ruby: {
+      method: "ruby-method",
+      singleton_method: "ruby-singleton-method",
+      class: "ruby-class",
+      module: "ruby-module"
+    },
+    c_sharp: {
+      class_declaration: "csharp-class",
+      interface_declaration: "csharp-interface",
+      struct_declaration: "csharp-struct",
+      enum_declaration: "csharp-enum",
+      method_declaration: "csharp-method"
+    }
+  };
+  return kindByLanguage[languageName]?.[nodeType];
+}
+
+function treeSitterNodeIsMissing(node: TreeSitterNode): boolean {
+  const isMissing = node.isMissing as unknown;
+  return typeof isMissing === "function" ? isMissing.call(node) : Boolean(isMissing);
+}
+
+function treeSitterNameForNode(node: TreeSitterNode): string | undefined {
+  const named = node.childForFieldName("name")?.text ?? node.childForFieldName("property")?.text;
+  if (named) return named;
+  const identifier = node.namedChildren.find((child) => /^(identifier|type_identifier|constant|name)$/.test(child.type));
+  return identifier?.text;
+}
+
+function extractTreeSitterContext(runtime: TreeSitterRuntime, language: TreeSitterLanguage, languageName: string, file: LoadedTextFile): { symbols: CodeSymbol[]; diagnostics: CodeDiagnostic[] } {
+  const parser = new runtime.Parser();
+  const timeoutSetter = parser.setTimeoutMicros as unknown;
+  if (typeof timeoutSetter === "function") {
+    timeoutSetter.call(parser, 100_000);
+  }
+  const symbols: CodeSymbol[] = [];
+  const diagnostics: CodeDiagnostic[] = [];
+  const parserName = `tree-sitter-${languageName.replace("_", "-")}`;
+  const seenSymbols = new Set<string>();
+  let errorCount = 0;
+
+  const visit = (node: TreeSitterNode): void => {
+    const kind = treeSitterSymbolKind(languageName, node.type);
+    if (kind) {
+      const name = treeSitterNameForNode(node);
+      if (name) {
+        const key = `${node.startIndex}:${kind}:${name}`;
+        if (!seenSymbols.has(key)) {
+          seenSymbols.add(key);
+          symbols.push({
+            path: file.path,
+            name,
+            kind,
+            line: node.startPosition.row + 1,
+            column: node.startPosition.column + 1,
+            source: "tree-sitter",
+            parser: parserName,
+            signature: trimSignature(node.text.split("\n", 1)[0] ?? node.text)
+          });
+        }
+      }
+    }
+
+    if (errorCount < 20 && (node.type === "ERROR" || treeSitterNodeIsMissing(node))) {
+      errorCount += 1;
+      diagnostics.push({
+        path: file.path,
+        message: node.type === "ERROR" ? `Tree-sitter parse error near ${trimSignature(node.text)}` : `Tree-sitter missing syntax node: ${node.type}`,
+        line: node.startPosition.row + 1,
+        column: node.startPosition.column + 1,
+        severity: "error",
+        source: "tree-sitter",
+        parser: parserName
+      });
+    }
+
+    for (const child of node.children) {
+      visit(child);
+    }
+  };
+
+  try {
+    parser.setLanguage(language);
+    const tree = parser.parse(file.content);
+    try {
+      visit(tree.rootNode);
+      return { symbols, diagnostics };
+    } finally {
+      tree.delete();
+    }
+  } finally {
+    parser.delete();
+  }
+}
+
 async function collectSemanticContext(files: LoadedTextFile[]): Promise<{ symbols: CodeSymbol[]; diagnostics: CodeDiagnostic[] }> {
   const ts = await loadTypeScript();
+  const treeSitter = await loadTreeSitterRuntime();
   const symbols: CodeSymbol[] = [];
   const diagnostics: CodeDiagnostic[] = [];
 
@@ -193,6 +394,20 @@ async function collectSemanticContext(files: LoadedTextFile[]): Promise<{ symbol
       const extracted = extractTypeScriptContext(ts, file);
       symbols.push(...extracted.symbols);
       diagnostics.push(...extracted.diagnostics);
+    } else if (treeSitter) {
+      const languageName = treeSitterLanguageName(file.path);
+      const language = languageName ? await loadTreeSitterLanguage(treeSitter, languageName) : undefined;
+      if (language && languageName) {
+        try {
+          const extracted = extractTreeSitterContext(treeSitter, language, languageName, file);
+          symbols.push(...extracted.symbols);
+          diagnostics.push(...extracted.diagnostics);
+        } catch {
+          symbols.push(...extractRegexSymbols(file));
+        }
+      } else {
+        symbols.push(...extractRegexSymbols(file));
+      }
     } else {
       symbols.push(...extractRegexSymbols(file));
     }
