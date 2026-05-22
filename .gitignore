@@ -1,0 +1,37 @@
+# Dependencies and package-manager caches
+node_modules/
+.pnpm-store/
+
+# Build and generated output
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# Local Code Agent state and run artifacts
+.code-agent/
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+id_rsa
+id_ed25519
+.ssh/
+.aws/
+.gcp/
+.azure/
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+.claude/
