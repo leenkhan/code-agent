@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { defaultGlobalConfig } from "../src/state/global-config.js";
 import { defaultProjectConfig } from "../src/state/project-config.js";
 
 describe("project config defaults", () => {
@@ -6,6 +7,12 @@ describe("project config defaults", () => {
     expect(defaultProjectConfig.autoApply).toBe(false);
     expect(defaultProjectConfig.maxRepairAttempts).toBe(3);
     expect(defaultProjectConfig.ignore).toContain(".git");
-    expect(defaultProjectConfig.model).toBe("deepseek-v4-pro");
+    expect(defaultProjectConfig.model).toBeUndefined();
+  });
+});
+
+describe("global config defaults", () => {
+  it("uses DeepSeek's Anthropic-compatible endpoint by default", () => {
+    expect(defaultGlobalConfig.baseUrl).toBe("https://api.deepseek.com/anthropic");
   });
 });

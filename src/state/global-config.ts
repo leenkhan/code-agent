@@ -2,16 +2,19 @@ import path from "node:path";
 import fs from "fs-extra";
 import { z } from "zod";
 import type { GlobalConfig } from "../types.js";
+import { getProviderDefinition, providerIds } from "../llm/catalog.js";
 import { globalStateDir, migrateGlobalState } from "./paths.js";
 
+const defaultProvider = getProviderDefinition("deepseek");
+
 export const defaultGlobalConfig: GlobalConfig = {
-  provider: "deepseek",
-  model: "deepseek-v4-pro",
-  baseUrl: "https://api.deepseek.com"
+  provider: defaultProvider.id,
+  model: defaultProvider.defaultModel,
+  baseUrl: defaultProvider.defaultBaseUrl
 };
 
 const globalConfigSchema = z.object({
-  provider: z.enum(["deepseek", "openai"]).default(defaultGlobalConfig.provider),
+  provider: z.enum(providerIds).default(defaultGlobalConfig.provider),
   apiKey: z.string().optional(),
   model: z.string().default(defaultGlobalConfig.model),
   baseUrl: z.string().url().optional()

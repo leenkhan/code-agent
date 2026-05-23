@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { appVersion } from "../src/version.js";
 
 describe("package metadata", () => {
   it("publishes only the codeshit binary", async () => {
@@ -13,8 +14,9 @@ describe("package metadata", () => {
     };
 
     expect(packageJson.name).toBe("@codeshit/cli");
-    expect(packageJson.version).toBe("0.3.1-beta.0");
-    expect(packageJson.bin).toEqual({ codeshit: "./dist/cli.js" });
+    expect(packageJson.version).toBe("0.3.1-beta.2");
+    expect(appVersion).toBe(packageJson.version);
+    expect(packageJson.bin).toEqual({ codeshit: "dist/cli.js" });
     expect(packageJson.bin["code-agent"]).toBeUndefined();
     expect(packageJson.publishConfig?.access).toBe("public");
     expect(packageJson.license).toBe("MIT");

@@ -1,28 +1,25 @@
 import type { RuntimeConfig } from "../types.js";
+import { getProviderDefinition } from "./catalog.js";
 import type { LlmProvider } from "./provider.js";
 import { AnthropicCompatibleProvider } from "./anthropic.js";
 import { DeepSeekProvider } from "./deepseek.js";
 import { OpenAiProvider } from "./openai.js";
 
 export function createLlmProvider(config: RuntimeConfig): LlmProvider {
+  const provider = getProviderDefinition(config.provider);
   if (!config.apiKey) {
-    const envName = config.provider === "deepseek" ? "DEEPSEEK_API_KEY" : "OPENAI_API_KEY";
-    throw new Error(`Missing ${config.provider} API key. Set ${envName} or run \`codeshit init\`.`);
+    throw new Error(`Missing ${config.provider} API key. Set ${provider.envKey} or run \`codeshit config\`.`);
   }
-  if (config.provider === "deepseek") {
-    if (config.baseUrl?.includes("/anthropic")) {
-      return new AnthropicCompatibleProvider(config.apiKey, {
-        baseUrl: config.baseUrl,
-        defaultModel: config.model
-      });
-    }
-    return new DeepSeekProvider(config.apiKey, {
-      baseUrl: config.baseUrl,
+
+  if (provider.wireProtocol === "anthropic" || config.baseUrl?.includes("/anthropic")) {
+    return new AnthropicCompatibleProvider(config.apiKey, {
+      baseUrl: config.baseUrl ?? provider.defaultBaseUrl ?? "https://api.anthropic.com",
       defaultModel: config.model
     });
   }
-  if (config.baseUrl?.includes("/anthropic")) {
-    return new AnthropicCompatibleProvider(config.apiKey, {
+
+  if (config.provider === "deepseek") {
+    return new DeepSeekProvider(config.apiKey, {
       baseUrl: config.baseUrl,
       defaultModel: config.model
     });

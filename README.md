@@ -34,7 +34,13 @@ Requirements:
 
 ## Quick Start
 
-Initialize config:
+Configure your global LLM provider:
+
+```bash
+codeshit config
+```
+
+Initialize the current directory as a CodeShit project:
 
 ```bash
 codeshit init
@@ -66,7 +72,8 @@ codeshit resume
 ## What It Does
 
 - `codeshit` / `codeshit chat`: starts an interactive terminal coding session.
-- `codeshit init`: creates global and project config.
+- `codeshit config`: creates or updates global LLM provider config.
+- `codeshit init`: creates or updates project config in the current directory.
 - `codeshit doctor`: prints project, config, Git, and environment diagnostics.
 - `codeshit plan "<task>"`: generates an implementation plan without editing files.
 - `codeshit fix`: runs validation and attempts repair from command output.
@@ -108,11 +115,22 @@ Project config:
 .codeshit/config.json
 ```
 
+Example global config:
+
+```json
+{
+  "provider": "deepseek",
+  "apiKey": "sk-...",
+  "model": "deepseek-v4-pro",
+  "baseUrl": "https://api.deepseek.com/anthropic"
+}
+```
+
 Example project config:
 
 ```json
 {
-  "model": "deepseek-v4-pro",
+  "model": "qwen3-coder-plus",
   "autoApply": false,
   "maxRepairAttempts": 3,
   "validationCommands": ["pnpm build", "pnpm test", "pnpm lint"],
@@ -125,6 +143,9 @@ You can also provide API keys through environment variables:
 ```bash
 export DEEPSEEK_API_KEY="sk-..."
 export OPENAI_API_KEY="sk-..."
+export ANTHROPIC_API_KEY="sk-ant-..."
+export GEMINI_API_KEY="..."
+export DASHSCOPE_API_KEY="..."
 ```
 
 Environment variables take precedence over config file `apiKey` values. CodeShit does not print API keys.
@@ -277,7 +298,7 @@ Validate the packed CLI in a temp project before publishing:
 
 ```bash
 npm pack --dry-run
-npm install -g ./codeshit-cli-0.3.1-beta.0.tgz
+npm install -g ./codeshit-cli-0.3.1-beta.2.tgz
 codeshit --help
 codeshit doctor
 ```

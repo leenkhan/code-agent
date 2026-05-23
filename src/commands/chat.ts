@@ -28,6 +28,7 @@ import {
 import { runValidationCommand } from "../tools/run-command.js";
 import { formatExternalServices, listExternalServices, parseServiceCommand, stopExternalService } from "../tools/external-service.js";
 import { askConfirm } from "../ui/confirm.js";
+import { appVersion } from "../version.js";
 import { formatCompactCommandResult } from "../ui/command-output.js";
 import { logger } from "../ui/logger.js";
 import { diffCommand } from "./diff.js";
@@ -1109,7 +1110,7 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
   await store.writeText("task.txt", "chat session");
   await store.writeJson("transcript.json", history);
 
-  logger.heading("CodeShit Chat");
+  logger.heading(`CodeShit Chat v${appVersion}`);
   logger.info("Type naturally. The CLI asks before editing files or running commands. Type /help for controls.");
 
   while (true) {

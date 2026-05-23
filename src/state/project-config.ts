@@ -2,10 +2,9 @@ import path from "node:path";
 import fs from "fs-extra";
 import { z } from "zod";
 import type { ProjectConfig } from "../types.js";
-import { migrateProjectState, projectStateDir } from "./paths.js";
+import { globalStateDir, migrateProjectState, projectStateDir } from "./paths.js";
 
 export const defaultProjectConfig: ProjectConfig = {
-  model: "deepseek-v4-pro",
   autoApply: false,
   maxRepairAttempts: 3,
   validationCommands: [],
@@ -13,7 +12,7 @@ export const defaultProjectConfig: ProjectConfig = {
 };
 
 const projectConfigSchema = z.object({
-  model: z.string().default(defaultProjectConfig.model),
+  model: z.string().optional(),
   autoApply: z.boolean().default(defaultProjectConfig.autoApply),
   maxRepairAttempts: z.number().int().min(0).default(defaultProjectConfig.maxRepairAttempts),
   validationCommands: z.array(z.string()).default(defaultProjectConfig.validationCommands),
@@ -21,7 +20,9 @@ const projectConfigSchema = z.object({
 });
 
 export function projectConfigPath(root: string): string {
-  return path.join(projectStateDir(root), "config.json");
+  const stateDir = projectStateDir(root);
+  const filename = path.resolve(stateDir) === path.resolve(globalStateDir()) ? "project-config.json" : "config.json";
+  return path.join(stateDir, filename);
 }
 
 export async function readProjectConfig(root: string): Promise<ProjectConfig> {

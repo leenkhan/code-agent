@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { resolveRuntimeConfig, supportedDeepSeekModels } from "../src/state/config.js";
+import { resolveRuntimeConfig } from "../src/state/config.js";
 
 describe("resolveRuntimeConfig", () => {
   let home: string;
@@ -17,7 +17,7 @@ describe("resolveRuntimeConfig", () => {
     await fs.rm(home, { recursive: true, force: true });
   });
 
-  it("falls back from invalid project deepseek model to global deepseek model", async () => {
+  it("uses raw project model overrides without provider-specific validation", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-config-"));
     await fs.mkdir(path.join(root, ".code-agent"), { recursive: true });
     await fs.writeFile(
@@ -30,14 +30,14 @@ describe("resolveRuntimeConfig", () => {
     const config = await resolveRuntimeConfig(root);
 
     expect(config.provider).toBe("deepseek");
-    expect(config.model).toBe("deepseek-v4-pro");
+    expect(config.model).toBe("help");
   });
 
-  it("rejects invalid explicit deepseek model overrides", async () => {
+  it("accepts explicit model overrides as advanced raw values", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-config-"));
     vi.stubEnv("DEEPSEEK_API_KEY", "test-key");
 
-    await expect(resolveRuntimeConfig(root, { model: "help" })).rejects.toThrow("Unsupported DeepSeek model");
+    await expect(resolveRuntimeConfig(root, { model: "help" })).resolves.toMatchObject({ model: "help" });
   });
 
   it("accepts valid deepseek model from project config", async () => {
@@ -88,6 +88,78 @@ describe("resolveRuntimeConfig", () => {
     expect(config.apiKey).toBe("env-test-key");
   });
 
+  it("reads provider-specific env keys for new providers", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-root-"));
+    await fs.mkdir(path.join(home, ".codeshit"), { recursive: true });
+    await fs.writeFile(
+      path.join(home, ".codeshit", "config.json"),
+      JSON.stringify({
+        provider: "qwen-cn",
+        model: "qwen3.6-plus",
+        baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+      }),
+      "utf8"
+    );
+    vi.stubEnv("DASHSCOPE_API_KEY", "dashscope-key");
+
+    const config = await resolveRuntimeConfig(root);
+
+    expect(config.provider).toBe("qwen-cn");
+    expect(config.apiKey).toBe("dashscope-key");
+  });
+
+  it("uses global provider model when project config has no model override", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-root-"));
+    await fs.mkdir(path.join(home, ".codeshit"), { recursive: true });
+    await fs.writeFile(
+      path.join(home, ".codeshit", "config.json"),
+      JSON.stringify({
+        provider: "claude",
+        apiKey: "claude-key",
+        model: "claude-sonnet-4-6",
+        baseUrl: "https://api.anthropic.com"
+      }),
+      "utf8"
+    );
+
+    const config = await resolveRuntimeConfig(root);
+
+    expect(config.provider).toBe("claude");
+    expect(config.model).toBe("claude-sonnet-4-6");
+  });
+
+  it("keeps global credentials when the project root is the home directory", async () => {
+    await fs.mkdir(path.join(home, ".codeshit"), { recursive: true });
+    await fs.writeFile(
+      path.join(home, ".codeshit", "config.json"),
+      JSON.stringify({
+        provider: "deepseek",
+        apiKey: "saved-key",
+        model: "deepseek-v4-pro",
+        baseUrl: "https://api.deepseek.com/anthropic"
+      }),
+      "utf8"
+    );
+    await fs.writeFile(
+      path.join(home, ".codeshit", "project-config.json"),
+      JSON.stringify({
+        model: "deepseek-v4-pro",
+        autoApply: true,
+        maxRepairAttempts: 2,
+        validationCommands: ["pnpm test"],
+        ignore: []
+      }),
+      "utf8"
+    );
+
+    const config = await resolveRuntimeConfig(home);
+
+    expect(config.apiKey).toBe("saved-key");
+    expect(config.baseUrl).toBe("https://api.deepseek.com/anthropic");
+    expect(config.autoApply).toBe(true);
+    expect(config.validationCommands).toEqual(["pnpm test"]);
+  });
+
   it("overrides autoApply from CLI options", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-config-"));
     vi.stubEnv("DEEPSEEK_API_KEY", "test-key");
@@ -130,13 +202,5 @@ describe("resolveRuntimeConfig", () => {
     expect(config.autoApply).toBe(false);
     expect(config.maxRepairAttempts).toBe(3);
     expect(config.validationCommands).toEqual([]);
-  });
-});
-
-describe("supportedDeepSeekModels", () => {
-  it("lists deepseek-v4-pro and deepseek-v4-flash", () => {
-    expect(supportedDeepSeekModels).toContain("deepseek-v4-pro");
-    expect(supportedDeepSeekModels).toContain("deepseek-v4-flash");
-    expect(supportedDeepSeekModels.length).toBe(2);
   });
 });

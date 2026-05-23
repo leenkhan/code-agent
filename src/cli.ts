@@ -3,27 +3,33 @@ import { Command } from "commander";
 import { findProjectRoot } from "./project/root.js";
 import { logger } from "./ui/logger.js";
 import { initCommand } from "./commands/init.js";
+import { configCommand } from "./commands/config.js";
 import { doctorCommand } from "./commands/doctor.js";
 import { planCommand } from "./commands/plan.js";
 import { fixCommand } from "./commands/fix.js";
 import { diffCommand } from "./commands/diff.js";
 import { revertCommand } from "./commands/revert.js";
 import { chatCommand } from "./commands/chat.js";
+import { appVersion } from "./version.js";
 
 async function main(): Promise<void> {
   const program = new Command();
   program
     .name("codeshit")
     .description("CodeShit — local-first coding agent for messy codebases")
-    .version("0.3.1-beta.0")
+    .version(appVersion, "-v, --version", "output the current version")
     .option("--model <model>", "model for interactive chat");
 
   program.action(async (options: { model?: string }) => {
     await chatCommand(await findProjectRoot(), options);
   });
 
-  program.command("init").description("Create global and project CodeShit config").action(async () => {
-    await initCommand(await findProjectRoot());
+  program.command("config").description("Create or update global CodeShit LLM config").action(async () => {
+    await configCommand();
+  });
+
+  program.command("init").description("Create or update project CodeShit config in the current directory").action(async () => {
+    await initCommand(process.cwd());
   });
 
   program.command("doctor").description("Print detected project and configuration information").action(async () => {

@@ -1,4 +1,16 @@
-export type ProviderName = "deepseek" | "openai";
+export type ProviderName =
+  | "openai"
+  | "deepseek"
+  | "zhipu-cn"
+  | "zhipu-global"
+  | "kimi-cn"
+  | "kimi-global"
+  | "minimax-cn"
+  | "minimax-global"
+  | "qwen-cn"
+  | "qwen-global"
+  | "claude"
+  | "gemini";
 
 export type GlobalConfig = {
   provider: ProviderName;
@@ -8,7 +20,7 @@ export type GlobalConfig = {
 };
 
 export type ProjectConfig = {
-  model: string;
+  model?: string;
   autoApply: boolean;
   maxRepairAttempts: number;
   validationCommands: string[];
@@ -19,6 +31,7 @@ export type RuntimeConfig = ProjectConfig & {
   provider: ProviderName;
   apiKey?: string;
   baseUrl?: string;
+  model: string;
 };
 
 export type ImportantFile = {

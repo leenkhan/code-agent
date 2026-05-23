@@ -33,6 +33,15 @@ describe("state paths and migration", () => {
     expect(tasksDir(root)).toBe(path.join(root, ".codeshit", "tasks"));
   });
 
+  it("keeps project config separate when the project root is the home directory", async () => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "codeshit-home-root-"));
+    cleanup.push(home);
+    vi.stubEnv("HOME", home);
+
+    expect(projectStateDir(home)).toBe(path.join(home, ".codeshit"));
+    expect(projectConfigPath(home)).toBe(path.join(home, ".codeshit", "project-config.json"));
+  });
+
   it("migrates old project state when new state is absent", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "codeshit-migrate-project-"));
     cleanup.push(root);
