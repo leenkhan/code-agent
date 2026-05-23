@@ -3,12 +3,12 @@ import { formatExternalServices, parseServiceCommand } from "../src/tools/extern
 
 describe("external service commands", () => {
   it("parses list services commands", () => {
-    expect(parseServiceCommand("code-agent list-services")).toEqual({ kind: "list", port: undefined });
-    expect(parseServiceCommand("code-agent list-services 8000")).toEqual({ kind: "list", port: 8000 });
+    expect(parseServiceCommand("codeshit list-services")).toEqual({ kind: "list", port: undefined });
+    expect(parseServiceCommand("codeshit list-services 8000")).toEqual({ kind: "list", port: 8000 });
   });
 
   it("parses stop service commands", () => {
-    expect(parseServiceCommand("code-agent stop-service 12345")).toEqual({ kind: "stop", pid: 12345 });
+    expect(parseServiceCommand("codeshit stop-service 12345")).toEqual({ kind: "stop", pid: 12345 });
   });
 
   it("ignores arbitrary shell commands", () => {

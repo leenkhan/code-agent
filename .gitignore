@@ -8,7 +8,8 @@ build/
 coverage/
 *.tsbuildinfo
 
-# Local Code Agent state and run artifacts
+# Local CodeShit state and run artifacts
+.codeshit/
 .code-agent/
 
 # Environment and secrets
@@ -25,6 +26,7 @@ id_ed25519
 
 # Logs
 *.log
+*.tgz
 npm-debug.log*
 pnpm-debug.log*
 yarn-debug.log*

@@ -2,6 +2,7 @@ import path from "node:path";
 import fs from "fs-extra";
 import { z } from "zod";
 import type { ProjectConfig } from "../types.js";
+import { migrateProjectState, projectStateDir } from "./paths.js";
 
 export const defaultProjectConfig: ProjectConfig = {
   model: "deepseek-v4-pro",
@@ -20,10 +21,11 @@ const projectConfigSchema = z.object({
 });
 
 export function projectConfigPath(root: string): string {
-  return path.join(root, ".code-agent", "config.json");
+  return path.join(projectStateDir(root), "config.json");
 }
 
 export async function readProjectConfig(root: string): Promise<ProjectConfig> {
+  await migrateProjectState(root);
   const configPath = projectConfigPath(root);
   if (!(await fs.pathExists(configPath))) {
     return defaultProjectConfig;
@@ -36,6 +38,7 @@ export async function readProjectConfig(root: string): Promise<ProjectConfig> {
 }
 
 export async function writeProjectConfig(root: string, config: ProjectConfig): Promise<void> {
+  await migrateProjectState(root);
   const configPath = projectConfigPath(root);
   await fs.ensureDir(path.dirname(configPath));
   await fs.writeJson(configPath, config, { spaces: 2 });

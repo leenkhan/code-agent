@@ -106,7 +106,7 @@ export async function* executeTask(params: {
 
     yield { kind: "step_code_plan", stepIndex: i, summary: actionPlan.summary };
 
-    const errors = validateCodeActionPlan(root, actionPlan);
+    const errors = validateCodeActionPlan(root, actionPlan, { requireFiles: !commandOnlyActionPlan });
     if (errors.length > 0) {
       state.status = "failed";
       state.knownFailures.push(`Step ${step.id} validation failed: ${errors.join("; ")}`);
@@ -244,7 +244,7 @@ export async function* executeTask(params: {
           break;
         }
 
-        const repairErrors = validateCodeActionPlan(root, repairPlan);
+        const repairErrors = validateCodeActionPlan(root, repairPlan, { requireFiles: true });
         if (repairErrors.length > 0) break;
 
         if (repairPlan.files.length > 0) {

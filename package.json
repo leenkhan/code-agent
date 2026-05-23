@@ -1,14 +1,35 @@
 {
-  "name": "code-agent",
-  "version": "0.3.0",
-  "description": "Local text-level CLI code agent",
+  "name": "@codeshit/cli",
+  "version": "0.3.1-beta.0",
+  "description": "Local-first coding agent for messy codebases",
   "type": "module",
   "bin": {
-    "code-agent": "./dist/cli.js"
+    "codeshit": "dist/cli.js"
   },
   "files": [
     "dist"
   ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/leenkhan/code-agent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/leenkhan/code-agent/issues"
+  },
+  "homepage": "https://github.com/leenkhan/code-agent#readme",
+  "keywords": [
+    "codeshit",
+    "coding-agent",
+    "cli",
+    "local-first",
+    "patch",
+    "ai",
+    "developer-tools"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "dev": "tsx src/cli.ts",
     "build": "tsup src/cli.ts --format esm --dts --clean",

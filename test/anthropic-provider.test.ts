@@ -28,6 +28,27 @@ describe("AnthropicCompatibleProvider", () => {
         })
       })
     );
+    const calls = fetchMock.mock.calls as unknown as Array<[string, RequestInit]>;
+    const init = calls[0]![1];
+    expect(JSON.parse(String(init.body)).max_tokens).toBe(8192);
+  });
+
+  it("retries thinking-only responses before failing the generation", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        content: [{ type: "thinking", thinking: "drafting..." }]
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        content: [{ type: "text", text: "{\"files\":[]}" }]
+      }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const provider = new AnthropicCompatibleProvider("test-key", {
+      baseUrl: "https://api.deepseek.com/anthropic"
+    });
+
+    await expect(provider.generateText({ system: "sys", prompt: "prompt" })).resolves.toBe("{\"files\":[]}");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("reports non-OK API responses with status and body", async () => {

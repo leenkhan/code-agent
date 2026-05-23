@@ -1,12 +1,20 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveRuntimeConfig, supportedDeepSeekModels } from "../src/state/config.js";
 
 describe("resolveRuntimeConfig", () => {
-  afterEach(() => {
+  let home: string;
+
+  beforeEach(async () => {
+    home = await fs.mkdtemp(path.join(os.tmpdir(), "codeshit-home-"));
+    vi.stubEnv("HOME", home);
+  });
+
+  afterEach(async () => {
     vi.unstubAllEnvs();
+    await fs.rm(home, { recursive: true, force: true });
   });
 
   it("falls back from invalid project deepseek model to global deepseek model", async () => {
@@ -63,10 +71,8 @@ describe("resolveRuntimeConfig", () => {
   });
 
   it("env API key overrides config file apiKey", async () => {
-    const home = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-home-"));
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-root-"));
     vi.stubEnv("DEEPSEEK_API_KEY", "env-key");
-    vi.stubEnv("HOME", home);
 
     const config = await resolveRuntimeConfig(root);
 

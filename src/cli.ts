@@ -13,16 +13,16 @@ import { chatCommand } from "./commands/chat.js";
 async function main(): Promise<void> {
   const program = new Command();
   program
-    .name("code-agent")
-    .description("Local text-level CLI code agent — natural language driven with auto-repair")
-    .version("0.3.0")
+    .name("codeshit")
+    .description("CodeShit — local-first coding agent for messy codebases")
+    .version("0.3.1-beta.0")
     .option("--model <model>", "model for interactive chat");
 
   program.action(async (options: { model?: string }) => {
     await chatCommand(await findProjectRoot(), options);
   });
 
-  program.command("init").description("Create global and project code-agent config").action(async () => {
+  program.command("init").description("Create global and project CodeShit config").action(async () => {
     await initCommand(await findProjectRoot());
   });
 
@@ -84,7 +84,7 @@ async function main(): Promise<void> {
       const tasks = await listTasks(root);
       const incomplete = tasks.filter((t) => t.status === "paused" || t.status === "blocked" || t.status === "running" || t.status === "failed");
       if (incomplete.length === 0) {
-        logger.info("No paused or incomplete tasks to resume. Use 'code-agent tasks' to see all tasks.");
+        logger.info("No paused or incomplete tasks to resume. Use 'codeshit tasks' to see all tasks.");
         return;
       }
       resolvedTaskId = incomplete[0].taskId;

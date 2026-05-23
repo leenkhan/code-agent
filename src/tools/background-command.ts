@@ -113,8 +113,8 @@ export async function stopBackgroundCommands(commands: RunningCommand[]): Promis
 
 export function parseStopBackgroundCommand(command: string): number | "all" | undefined {
   const trimmed = command.trim();
-  if (trimmed === "code-agent stop-background all") return "all";
-  const match = trimmed.match(/^code-agent\s+stop-background\s+(\d+)$/);
+  if (trimmed === "codeshit stop-background all") return "all";
+  const match = trimmed.match(/^codeshit\s+stop-background\s+(\d+)$/);
   return match ? Number(match[1]) : undefined;
 }
 

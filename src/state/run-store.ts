@@ -1,6 +1,7 @@
 import path from "node:path";
 import fs from "fs-extra";
 import type { ProjectContext, RunResult } from "../types.js";
+import { migrateProjectState, projectStateDir } from "./paths.js";
 
 export type RunStore = {
   dir: string;
@@ -23,10 +24,11 @@ function timestamp(): string {
 }
 
 export function runsDir(root: string): string {
-  return path.join(root, ".code-agent", "runs");
+  return path.join(projectStateDir(root), "runs");
 }
 
 export async function createRunStore(root: string, task: string): Promise<RunStore> {
+  await migrateProjectState(root);
   const dir = path.join(runsDir(root), `${timestamp()}-${slugify(task)}`);
   await fs.ensureDir(dir);
   return {
@@ -41,6 +43,7 @@ export async function createRunStore(root: string, task: string): Promise<RunSto
 }
 
 export async function latestRun(root: string): Promise<string | undefined> {
+  await migrateProjectState(root);
   const dir = runsDir(root);
   if (!(await fs.pathExists(dir))) {
     return undefined;

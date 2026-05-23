@@ -203,15 +203,15 @@ For code_change, produce a concise task that can be passed to the patch workflow
 For task_goal, preserve the full user goal so the task runtime can decompose it into steps.
 For command, produce one safe command string. Prefer command only for explicit one-shot requests. Prefer validation commands like pnpm test, pnpm build, pnpm lint, npm test, npm run build, npm run lint, npx tsc --noEmit.
 If the user wants to stop a currently running background command, return command intent with exactly:
-- code-agent stop-background <id>
+- codeshit stop-background <id>
 Use the running command id from the runtime context. If the user wants to stop all background commands, return:
-- code-agent stop-background all
+- codeshit stop-background all
 If the user wants to discover externally running local services, return:
-- code-agent list-services
+- codeshit list-services
 If the user names a port, return:
-- code-agent list-services <port>
+- codeshit list-services <port>
 If the runtime context contains an external service pid and the user wants to stop that external service, return:
-- code-agent stop-service <pid>
+- codeshit stop-service <pid>
 If the user asks to stop an external service but no pid is known yet, return a list-services command first.
 Never choose command for dangerous, publishing, deployment, sudo, or destructive requests; answer with a refusal instead.
 Reply in the user's language for answer intent.`,

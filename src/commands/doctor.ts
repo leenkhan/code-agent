@@ -23,7 +23,7 @@ export async function doctorCommand(root: string): Promise<void> {
   const envName = globalConfig.provider === "deepseek" ? "DEEPSEEK_API_KEY" : "OPENAI_API_KEY";
   const envKey = globalConfig.provider === "deepseek" ? process.env.DEEPSEEK_API_KEY : process.env.OPENAI_API_KEY;
 
-  logger.heading("Code Agent Doctor");
+  logger.heading("CodeShit Doctor");
   logger.info(`Current working directory: ${process.cwd()}`);
   logger.info(`Detected project root: ${root}`);
   logger.info(`Git available: ${gitAvailable ? "yes" : "no"}`);

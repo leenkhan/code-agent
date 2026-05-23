@@ -1,8 +1,8 @@
-import os from "node:os";
 import path from "node:path";
 import fs from "fs-extra";
 import { z } from "zod";
 import type { GlobalConfig } from "../types.js";
+import { globalStateDir, migrateGlobalState } from "./paths.js";
 
 export const defaultGlobalConfig: GlobalConfig = {
   provider: "deepseek",
@@ -18,10 +18,11 @@ const globalConfigSchema = z.object({
 });
 
 export function globalConfigPath(): string {
-  return path.join(os.homedir(), ".code-agent", "config.json");
+  return path.join(globalStateDir(), "config.json");
 }
 
 export async function readGlobalConfig(): Promise<GlobalConfig> {
+  await migrateGlobalState();
   const configPath = globalConfigPath();
   if (!(await fs.pathExists(configPath))) {
     return defaultGlobalConfig;
@@ -34,6 +35,7 @@ export async function readGlobalConfig(): Promise<GlobalConfig> {
 }
 
 export async function writeGlobalConfig(config: GlobalConfig): Promise<void> {
+  await migrateGlobalState();
   const configPath = globalConfigPath();
   await fs.ensureDir(path.dirname(configPath));
   await fs.writeJson(configPath, config, { spaces: 2 });

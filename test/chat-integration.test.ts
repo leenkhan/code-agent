@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { execa } from "execa";
-import { describe, expect, it, vi, afterEach } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mathTs = [
   "export function add(a: number, b: number): number { return a + b; }",
@@ -13,6 +13,20 @@ const mathTs = [
   "  return a / b;",
   "}"
 ].join("\n");
+
+let testHome = "";
+
+beforeEach(async () => {
+  testHome = await fs.mkdtemp(path.join(os.tmpdir(), "codeshit-chat-home-"));
+  vi.stubEnv("HOME", testHome);
+});
+
+afterEach(async () => {
+  if (testHome) {
+    await fs.rm(testHome, { recursive: true, force: true });
+    testHome = "";
+  }
+});
 
 const brokenMathTs = [
   "export function add(a: number, b: number): number { return a + b; }",
@@ -388,7 +402,7 @@ describe("chat integration: plan command", () => {
     expect(calls.some((prompt) => prompt.includes("prefer session cookies"))).toBe(true);
     expect(calls.some((prompt) => prompt.includes("Return JSON matching one of:"))).toBe(false);
     expect(calls.some((prompt) => prompt.includes("Return JSON with this exact shape"))).toBe(true);
-    const taskRoot = path.join(root, ".code-agent", "tasks");
+    const taskRoot = path.join(root, ".codeshit", "tasks");
     const taskIds = await fs.readdir(taskRoot);
     expect(taskIds).toHaveLength(1);
     await expect(fs.readFile(path.join(taskRoot, taskIds[0]!, "plan.json"), "utf8")).resolves.toContain("Add a reviewed login flow");

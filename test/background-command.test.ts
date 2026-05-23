@@ -9,8 +9,8 @@ describe("background command helpers", () => {
   });
 
   it("parses model-returned stop commands", () => {
-    expect(parseStopBackgroundCommand("code-agent stop-background 1")).toBe(1);
-    expect(parseStopBackgroundCommand("code-agent stop-background all")).toBe("all");
+    expect(parseStopBackgroundCommand("codeshit stop-background 1")).toBe(1);
+    expect(parseStopBackgroundCommand("codeshit stop-background all")).toBe("all");
     expect(parseStopBackgroundCommand("停止服务")).toBeUndefined();
   });
 

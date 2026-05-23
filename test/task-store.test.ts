@@ -128,7 +128,7 @@ describe("task-store", () => {
     await store.writeState(state);
 
     // Create a corrupted dir without state.json
-    const corruptedDir = path.join(root, ".code-agent", "tasks", "corrupted-dir");
+    const corruptedDir = path.join(root, ".codeshit", "tasks", "corrupted-dir");
     await fs.ensureDir(corruptedDir);
 
     const tasks = await listTasks(root);

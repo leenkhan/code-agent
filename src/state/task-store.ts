@@ -1,6 +1,7 @@
 import path from "node:path";
 import fs from "fs-extra";
 import type { TaskPlan, TaskState } from "../types.js";
+import { migrateProjectState, projectStateDir } from "./paths.js";
 
 export type TaskStore = {
   dir: string;
@@ -27,10 +28,11 @@ function taskTimestamp(): string {
 }
 
 export function tasksDir(root: string): string {
-  return path.join(root, ".code-agent", "tasks");
+  return path.join(projectStateDir(root), "tasks");
 }
 
 export async function createTaskStore(root: string, goal: string): Promise<TaskStore> {
+  await migrateProjectState(root);
   const taskId = `${taskTimestamp()}-${slugify(goal)}`;
   const dir = path.join(tasksDir(root), taskId);
   await fs.ensureDir(dir);
@@ -59,6 +61,7 @@ export async function createTaskStore(root: string, goal: string): Promise<TaskS
 }
 
 export async function listTasks(root: string): Promise<Array<{ taskId: string; goal: string; status: string; updatedAt: string }>> {
+  await migrateProjectState(root);
   const dir = tasksDir(root);
   if (!(await fs.pathExists(dir))) return [];
 
@@ -91,6 +94,7 @@ export async function listTasks(root: string): Promise<Array<{ taskId: string; g
 }
 
 export async function loadTaskStore(root: string, taskId: string): Promise<TaskStore | undefined> {
+  await migrateProjectState(root);
   const dir = path.join(tasksDir(root), taskId);
   if (!(await fs.pathExists(dir))) return undefined;
 

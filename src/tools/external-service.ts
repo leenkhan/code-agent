@@ -15,11 +15,11 @@ export type ServiceCommand =
 
 export function parseServiceCommand(command: string): ServiceCommand | undefined {
   const trimmed = command.trim();
-  const list = trimmed.match(/^code-agent\s+list-services(?:\s+(\d+))?$/);
+  const list = trimmed.match(/^codeshit\s+list-services(?:\s+(\d+))?$/);
   if (list) {
     return { kind: "list", port: list[1] ? Number(list[1]) : undefined };
   }
-  const stop = trimmed.match(/^code-agent\s+stop-service\s+(\d+)$/);
+  const stop = trimmed.match(/^codeshit\s+stop-service\s+(\d+)$/);
   if (stop) {
     return { kind: "stop", pid: Number(stop[1]) };
   }
@@ -78,7 +78,7 @@ export function formatExternalServices(services: ExternalService[]): string {
   ];
   const hidden = unique.length - visible.length;
   if (hidden > 0) {
-    rows.push(`... ${hidden} more service(s) hidden. Ask for a specific port, e.g. code-agent list-services 8000.`);
+    rows.push(`... ${hidden} more service(s) hidden. Ask for a specific port, e.g. codeshit list-services 8000.`);
   }
   return rows.join("\n");
 }

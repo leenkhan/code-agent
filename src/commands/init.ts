@@ -52,5 +52,5 @@ export async function initCommand(root: string): Promise<void> {
   }
   await fs.ensureDir(runsDir(root));
   logger.success(`Runs directory ready: ${runsDir(root)}`);
-  logger.info("Next steps: run `code-agent doctor`, then `code-agent plan \"your task\"`.");
+  logger.info("Next steps: run `codeshit doctor`, then `codeshit plan \"your task\"`.");
 }

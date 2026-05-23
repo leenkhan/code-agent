@@ -33,6 +33,17 @@ describe("code actions", () => {
     expect(errors.join("\n")).toContain("Path traversal blocked");
   });
 
+  it("can require file actions for code change tasks", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-actions-"));
+    const errors = validateCodeActionPlan(root, {
+      summary: "Only explain how to open a file",
+      files: [],
+      commands: [{ command: "echo open index.html", reason: "manual instruction" }]
+    }, { requireFiles: true });
+
+    expect(errors).toContain("No file actions were returned for a code change task.");
+  });
+
   it("writes confirmed file actions", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-actions-"));
     await applyFileActions(root, [{ path: "app/main.py", content: "print('ok')\n" }]);
@@ -49,11 +60,11 @@ describe("code actions", () => {
       { path: "README.md", content: "new\n" },
       { path: "src/main.ts", content: "export const ok = true;\n" }
     ], {
-      artifactDir: path.join(root, ".code-agent", "runs", "test-run"),
+      artifactDir: path.join(root, ".codeshit", "runs", "test-run"),
       patchName: "patch.diff"
     });
 
-    const patch = await fs.readFile(path.join(root, ".code-agent", "runs", "test-run", "patch.diff"), "utf8");
+    const patch = await fs.readFile(path.join(root, ".codeshit", "runs", "test-run", "patch.diff"), "utf8");
     expect(result.appliedWithPatch).toBe(true);
     expect(result.filesChanged).toEqual(["README.md", "src/main.ts"]);
     expect(patch).toContain("--- a/README.md");
@@ -138,5 +149,27 @@ describe("code actions", () => {
     expect(plan.files).toEqual([{ path: "build.gradle.kts", content: "plugins {}\n" }]);
     expect(progress[0]).toBe("Generating file actions: planning file list");
     expect(progress).toContain("Generating file actions: files 1-1/1");
+  });
+
+  it("fails chunked generation when manifest files do not produce content", async () => {
+    const provider: LlmProvider = {
+      async generateText(input) {
+        if (input.system.includes("compact file manifest")) {
+          return JSON.stringify({
+            summary: "Create HTML game",
+            files: [{ path: "index.html", purpose: "single-file game" }],
+            commands: []
+          });
+        }
+        throw new Error("Anthropic-compatible API response did not include text content.");
+      }
+    };
+
+    await expect(generateCodeActionPlan({
+      provider,
+      model: "test",
+      task: "创建一个项目，实现俄罗斯方块小游戏",
+      context: { root: "/tmp/test", fileTree: [], importantFiles: [] }
+    })).rejects.toThrow("Failed to generate file contents");
   });
 });

@@ -7,7 +7,7 @@ import { OpenAiProvider } from "./openai.js";
 export function createLlmProvider(config: RuntimeConfig): LlmProvider {
   if (!config.apiKey) {
     const envName = config.provider === "deepseek" ? "DEEPSEEK_API_KEY" : "OPENAI_API_KEY";
-    throw new Error(`Missing ${config.provider} API key. Set ${envName} or run \`code-agent init\`.`);
+    throw new Error(`Missing ${config.provider} API key. Set ${envName} or run \`codeshit init\`.`);
   }
   if (config.provider === "deepseek") {
     if (config.baseUrl?.includes("/anthropic")) {

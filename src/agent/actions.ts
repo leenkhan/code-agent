@@ -212,6 +212,7 @@ Return JSON:
   input.onProgress?.("Generating file actions: parsing file list");
   const manifest = parseCodeActionManifest(manifestResponse);
   const files: FileAction[] = [];
+  const failedFiles: string[] = [];
 
   const batchSize = 5;
   for (let batchStart = 0; batchStart < manifest.files.length; batchStart += batchSize) {
@@ -219,14 +220,16 @@ Return JSON:
     const batchEnd = Math.min(batchStart + batchSize, manifest.files.length);
     input.onProgress?.(`Generating file actions: files ${batchStart + 1}-${batchEnd}/${manifest.files.length}`);
 
-    const batchResponse = await input.provider.generateText({
-      model: input.model,
-      responseFormat: "json_object",
-      system: `You generate complete source files for a local code project.
+    let batchData: { files: FileAction[] };
+    try {
+      const batchResponse = await input.provider.generateText({
+        model: input.model,
+        responseFormat: "json_object",
+        system: `You generate complete source files for a local code project.
 Return only strict JSON. Do not include markdown fences.
 All file contents must be complete and correct.
 Maintain consistency across files (imports, references, types).`,
-      prompt: `Overall task:
+        prompt: `Overall task:
 ${input.task}
 
 Project context:
@@ -244,10 +247,7 @@ Return JSON:
     {"path": "relative/path", "content": "complete file content"}
   ]
 }`
-    });
-
-    let batchData: { files: FileAction[] };
-    try {
+      });
       const parsed = JSON.parse(extractJson(batchResponse)) as { files?: FileAction[] };
       if (parsed.files?.length && parsed.files.every((file) => typeof file.path === "string" && typeof file.content === "string")) {
         batchData = { files: parsed.files };
@@ -270,8 +270,8 @@ Return JSON:
             prompt: `Task: ${input.task}\nFile to generate:\n${JSON.stringify(file, null, 2)}`
           });
           files.push(parseFileContent(fileResponse));
-        } catch {
-          // skip files that fail to generate
+        } catch (error) {
+          failedFiles.push(`${file.path}: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
       continue;
@@ -280,6 +280,13 @@ Return JSON:
     for (const f of batchData.files) {
       files.push(f);
     }
+  }
+  if (failedFiles.length > 0) {
+    throw new Error(`Failed to generate file contents for ${failedFiles.length}/${manifest.files.length} manifest file(s): ${failedFiles.join("; ")}`);
+  }
+  const missingFiles = manifest.files.filter((file) => !files.some((generated) => generated.path === file.path));
+  if (missingFiles.length > 0) {
+    throw new Error(`Model did not return content for manifest file(s): ${missingFiles.map((file) => file.path).join(", ")}`);
   }
   input.onProgress?.("Generating file actions: assembling plan");
   return {
@@ -298,7 +305,7 @@ export async function repairCodeActionJson(input: {
   const repaired = await input.provider.generateText({
     model: input.model,
     responseFormat: "json_object",
-    system: `Convert a failed code-agent response into strict JSON.
+    system: `Convert a failed CodeShit response into strict JSON.
 Return only one JSON object. Do not include markdown fences.
 The output must match:
 {
@@ -338,8 +345,11 @@ function resolveActionPath(root: string, relativePath: string): string {
   return absolute;
 }
 
-export function validateCodeActionPlan(root: string, plan: CodeActionPlan): string[] {
+export function validateCodeActionPlan(root: string, plan: CodeActionPlan, options: { requireFiles?: boolean } = {}): string[] {
   const errors: string[] = [];
+  if (options.requireFiles && plan.files.length === 0) {
+    errors.push("No file actions were returned for a code change task.");
+  }
   if (plan.files.length === 0 && plan.commands.length === 0) {
     errors.push("No file or command actions were returned.");
   }

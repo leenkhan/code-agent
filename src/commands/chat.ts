@@ -1034,7 +1034,7 @@ async function runRepairLoop(params: {
       break;
     }
 
-    const repairErrors = validateCodeActionPlan(root, repairPlan);
+      const repairErrors = validateCodeActionPlan(root, repairPlan, { requireFiles: true });
     if (repairErrors.length > 0) {
       logger.error(`Repair validation failed:\n${repairErrors.join("\n")}`);
       history.push({ role: "assistant", content: `修复校验失败：${repairErrors.join("; ")}` });
@@ -1109,7 +1109,7 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
   await store.writeText("task.txt", "chat session");
   await store.writeJson("transcript.json", history);
 
-  logger.heading("Code Agent Chat");
+  logger.heading("CodeShit Chat");
   logger.info("Type naturally. The CLI asks before editing files or running commands. Type /help for controls.");
 
   while (true) {
@@ -1397,7 +1397,7 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
       await store.writeJson("last-code-actions.json", actionPlan);
       logger.heading("Proposed file actions");
       logger.info(formatCodeActionPlan(actionPlan));
-      const errors = validateCodeActionPlan(root, actionPlan);
+      const errors = validateCodeActionPlan(root, actionPlan, { requireFiles: true });
       if (errors.length > 0) {
         logger.error(`Code action validation failed:\n${errors.join("\n")}`);
         history.push({ role: "assistant", content: `代码动作校验失败：${errors.join("; ")}` });

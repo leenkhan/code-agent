@@ -185,7 +185,7 @@ describe("existing project inspection", () => {
         "build.gradle.kts",
         "settings.gradle.kts",
         "src/main/kotlin/com/example/App.kt",
-        ".code-agent/runs/latest.json"
+        ".codeshit/runs/latest.json"
       ],
       importantFiles: []
     });

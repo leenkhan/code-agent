@@ -1,7 +1,7 @@
 import type { LlmProvider } from "./provider.js";
 
 type AnthropicResponse = {
-  content?: Array<{ type?: string; text?: string }>;
+  content?: Array<{ type?: string; text?: string; thinking?: string }>;
   error?: { message?: string; type?: string };
 };
 
@@ -12,6 +12,7 @@ export class AnthropicCompatibleProvider implements LlmProvider {
   private readonly timeoutMs: number;
   private readonly maxRetries: number;
   private readonly retryBaseMs: number;
+  private readonly maxTokens: number;
 
   constructor(apiKey: string, options: { baseUrl: string; defaultModel?: string }) {
     this.apiKey = apiKey;
@@ -20,6 +21,7 @@ export class AnthropicCompatibleProvider implements LlmProvider {
     this.timeoutMs = Number(process.env.CODE_AGENT_LLM_TIMEOUT_MS ?? 120000);
     this.maxRetries = Number(process.env.CODE_AGENT_LLM_RETRIES ?? 2);
     this.retryBaseMs = Number(process.env.CODE_AGENT_LLM_RETRY_BASE_MS ?? 1000);
+    this.maxTokens = Number(process.env.CODE_AGENT_LLM_MAX_TOKENS ?? 8192);
   }
 
   async generateText(input: {
@@ -60,7 +62,7 @@ export class AnthropicCompatibleProvider implements LlmProvider {
         },
         body: JSON.stringify({
           model: input.model ?? this.defaultModel,
-          max_tokens: 4096,
+          max_tokens: this.maxTokens,
           temperature: 0.2,
           system: input.system,
           messages: [
@@ -94,7 +96,12 @@ export class AnthropicCompatibleProvider implements LlmProvider {
         .join("")
         .trim() ?? "";
       if (!text) {
-        throw new Error(`Anthropic-compatible API response did not include text content. Response preview: ${body.slice(0, 300)}`);
+        const contentTypes = data.content?.map((part) => part.type ?? "text").join(", ") || "none";
+        const hasThinking = data.content?.some((part) => part.type === "thinking" || Boolean(part.thinking)) ?? false;
+        const hint = hasThinking
+          ? ` The response only contained thinking content; the model likely ran out of output budget before producing the final answer. Current max_tokens=${this.maxTokens}.`
+          : "";
+        throw new Error(`Anthropic-compatible API response did not include text content. Content types: ${contentTypes}.${hint} Response preview: ${body.slice(0, 300)}`);
       }
       return text;
     } catch (error) {
@@ -111,6 +118,7 @@ export class AnthropicCompatibleProvider implements LlmProvider {
 function isRetryableError(error: unknown): boolean {
   if (error instanceof DOMException && error.name === "AbortError") return false;
   if (!(error instanceof Error)) return true;
+  if (error.message.includes("only contained thinking content")) return true;
   if (error.message.includes("response did not include text content")) return false;
   if (error.message.includes("response was not JSON")) return false;
   return /\b(?:429|500|502|503|504)\b/.test(error.message);
