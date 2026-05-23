@@ -6,7 +6,8 @@ import { executeTask, resolveResumeStepIndex } from "../src/agent/task-executor.
 import { createTaskStore } from "../src/state/task-store.js";
 import type { LlmProvider } from "../src/llm/provider.js";
 import type { RuntimeConfig, TaskPlan, TaskState } from "../src/types.js";
-import { generateCodeActionPlan } from "../src/agent/actions.js";
+import { generateCodeActionPlan, generateEnvironmentFix } from "../src/agent/actions.js";
+import { runValidationCommand } from "../src/tools/run-command.js";
 
 vi.mock("../src/project/context.js", () => ({
   collectProjectContext: vi.fn().mockResolvedValue({
@@ -141,6 +142,63 @@ describe("task executor state machine", () => {
     expect(events).not.toContain("step_files_written");
     expect(saved?.completedSteps).toHaveLength(0);
     expect(saved?.lastFailure?.command).toBe("./gradlew build -x test");
+  });
+
+  it("treats a command as passed when an environment fix retry succeeds", async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-task-executor-"));
+    const store = await createTaskStore(root, "修复 wrapper 后构建");
+    const plan: TaskPlan = {
+      goal: "修复 wrapper 后构建",
+      steps: [{
+        id: "1",
+        title: "Compile",
+        description: "Compile project",
+        expectedFiles: [],
+        verification: "./gradlew compile",
+        milestone: false
+      }]
+    };
+    const state = makeState(store.taskId);
+    await store.writePlan(plan);
+    await store.writeState(state);
+
+    vi.mocked(generateEnvironmentFix).mockResolvedValueOnce({
+      files: [{ path: "gradlew", content: "#!/usr/bin/env sh\n" }],
+      commands: []
+    });
+    vi.mocked(runValidationCommand)
+      .mockResolvedValueOnce({
+        command: "./gradlew compile",
+        exitCode: 1,
+        stdout: "",
+        stderr: "Error: Invalid or corrupt jarfile ./.gradle/wrapper/gradle-wrapper.jar",
+        durationMs: 12
+      })
+      .mockResolvedValueOnce({
+        command: "chmod +x gradlew",
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        durationMs: 2
+      })
+      .mockResolvedValueOnce({
+        command: "./gradlew compile",
+        exitCode: 0,
+        stdout: "BUILD SUCCESS",
+        stderr: "",
+        durationMs: 20
+      });
+
+    const events = [];
+    for await (const event of executeTask({ root, config: makeConfig(), provider, plan, state, store })) {
+      events.push(event.kind);
+    }
+
+    const saved = await store.readState();
+    expect(events).toContain("step_environment_issue");
+    expect(events).toContain("step_completed");
+    expect(events).not.toContain("step_repair");
+    expect(saved?.completedSteps[0]?.verificationResult).toBe("passed");
   });
 
   it("resumes blocked tasks from the failed step, not the next step", () => {

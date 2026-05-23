@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { execa } from "execa";
 import { applyFileActions, generateCodeActionPlan, parseCodeActionPlan, validateCodeActionPlan } from "../src/agent/actions.js";
 import type { LlmProvider } from "../src/llm/provider.js";
 
@@ -37,6 +38,32 @@ describe("code actions", () => {
     await applyFileActions(root, [{ path: "app/main.py", content: "print('ok')\n" }]);
 
     await expect(fs.readFile(path.join(root, "app/main.py"), "utf8")).resolves.toBe("print('ok')\n");
+  });
+
+  it("stores and applies file actions as a patch in git projects", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-actions-"));
+    await execa("git", ["init"], { cwd: root });
+    await fs.writeFile(path.join(root, "README.md"), "old\n", "utf8");
+
+    const result = await applyFileActions(root, [
+      { path: "README.md", content: "new\n" },
+      { path: "src/main.ts", content: "export const ok = true;\n" }
+    ], {
+      artifactDir: path.join(root, ".code-agent", "runs", "test-run"),
+      patchName: "patch.diff"
+    });
+
+    const patch = await fs.readFile(path.join(root, ".code-agent", "runs", "test-run", "patch.diff"), "utf8");
+    expect(result.appliedWithPatch).toBe(true);
+    expect(result.filesChanged).toEqual(["README.md", "src/main.ts"]);
+    expect(patch).toContain("--- a/README.md");
+    expect(patch).toContain("+++ b/README.md");
+    expect(patch).toContain("-old");
+    expect(patch).toContain("+new");
+    expect(patch).toContain("--- /dev/null");
+    expect(patch).toContain("+++ b/src/main.ts");
+    await expect(fs.readFile(path.join(root, "README.md"), "utf8")).resolves.toBe("new\n");
+    await expect(fs.readFile(path.join(root, "src/main.ts"), "utf8")).resolves.toBe("export const ok = true;\n");
   });
 
   it("falls back to manifest and per-file generation when full action generation fails", async () => {

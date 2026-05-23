@@ -9,12 +9,12 @@ v0.3 的核心主题是**有状态的自主编程**：agent 不再只是"修改�
 ## 功能概览
 
 - `code-agent init`：初始化全局配置和项目配置。
-- `code-agent` / `code-agent chat`：进入交互式对话模式。用自然语言描述需求，LLM 自动识别意图（问答/改代码/执行命令），**复杂任务自动分解为多步计划并逐步执行**，每步写入文件、运行验证、失败时自动修复。耗时阶段会显示进度状态和执行耗时。
+- `code-agent` / `code-agent chat`：进入交互式对话模式。用自然语言描述需求，LLM 自动识别意图（问答/改代码/执行命令），**复杂任务自动分解为多步计划并逐步执行**，每步写入文件、运行验证、失败时自动修复。写入前会在 CLI 展示 unified diff 对比，耗时阶段会显示进度状态和执行耗时。
 - `code-agent doctor`：检查当前项目、配置、Git 和环境信息。
 - `code-agent plan "<任务>"`：只生成实现计划，不修改文件。
 - `code-agent fix`：基于当前验证失败结果尝试生成修复补丁。
-- `code-agent diff`：打印当前 `git diff`，并显示最近一次运行产物位置。
-- `code-agent revert`：反向应用最近一次运行保存的补丁。
+- `code-agent diff`：打印当前 `git diff`，并显示最近一次运行产物和 patch 历史。
+- `code-agent revert`：反向应用最近一次运行保存的最新补丁。
 - `code-agent tasks`：列出所有已保存的任务及其状态。
 - `code-agent resume [task-id]`：恢复一个暂停或未完成的任务，从断点继续执行。
 
@@ -210,6 +210,19 @@ Running command: pnpm test (2.1s)
 
 如果模型判断你想修改代码，CLI 会先展示建议任务，再让模型生成结构化文件动作。确认后写入文件，然后按模型建议运行验证命令。
 
+写入文件前，CLI 会把结构化文件动作转换为 unified diff 并直接打印到终端，例如：
+
+```txt
+Patch: patch.diff
+===================================================================
+--- a/src/auth/User.java
++++ b/src/auth/User.java
+@@ -12,6 +12,8 @@
+ ...
+```
+
+多步任务、普通代码修改、自动修复和环境修复都会使用同一套 patch 展示和保存机制。patch 会写入 `.code-agent/runs/<run>/`，用于审查、调试和回滚。
+
 如果验证命令失败（如测试报错、编译失败），CLI 会**自动将错误信息反馈给 LLM，生成修复文件**，并在你确认后应用修复、重新运行验证。这个修复循环会持续到验证通过或达到 `maxRepairAttempts` 上限。
 
 整个过程在 chat 模式下自然完成，不需要切换命令。
@@ -251,9 +264,11 @@ Plan Mode 下输入提示会显示为 `you [PLAN - Shift+Tab exits]`，用于明
 
 1. **任务分解**：LLM 将目标分解为有序、可独立验证的步骤（如：安装依赖 → 添加路由 → 添加 callback handler → 更新 env schema → 更新前端 → 添加中间件 → 写测试 → 验证）。
 2. **逐步执行**：agent 按顺序执行每个步骤，每步独立生成代码、写入文件、运行验证、失败时进入修复循环。
-3. **里程碑暂停**：涉及认证、数据库迁移、环境配置、中间件等关键步骤时自动暂停，等待用户确认后再继续。
-4. **断点续传**：任务状态持久化到 `.code-agent/tasks/`，可随时 `/exit` 退出，下次用 `/resume` 从断点继续。
-5. **进度展示**：每步执行时显示 `[2/8] 添加 OAuth route...` 及完成状态（✅ 通过 / ❌ 失败 / ⏭️ 跳过）。
+3. **Patch 对比**：每个会修改文件的步骤都会先在 CLI 打印 `Patch: step-N-id.diff`，再应用补丁并保存到运行产物目录。
+4. **环境修复重试**：如果验证失败来自本地工具或 wrapper 问题，agent 会先尝试生成环境修复；修复后重试成功时，该步骤会正常通过，不会把首次环境失败误判为代码失败。
+5. **里程碑暂停**：涉及认证、数据库迁移、环境配置、中间件等关键步骤时自动暂停，等待用户确认后再继续。
+6. **断点续传**：任务状态持久化到 `.code-agent/tasks/`，可随时 `/exit` 退出，下次用 `/resume` 从断点继续。
+7. **进度展示**：每步执行时显示 `[2/8] 添加 OAuth route...` 及完成状态（✅ 通过 / ❌ 失败 / ⏭️ 跳过）。
 
 简单任务（单文件修改、小 bug 修复）仍使用原有的单轮代码生成流程，不会进入多步模式。
 
@@ -304,14 +319,14 @@ node dist/cli.js fix --cmd "pnpm test"
 
 ### `diff`
 
-打印当前 `git diff`，并显示最近一次运行目录和补丁路径。
+打印当前 `git diff`，并显示最近一次运行目录、最新 patch 和该运行目录下的 patch 历史。
 
 ### `revert`
 
-查找最近一次运行保存的 `patch.diff`，确认后执行：
+查找最近一次运行保存的最新 `.diff` patch，确认后执行：
 
 ```bash
-git apply -R patch.diff
+git apply -R <latest-patch.diff>
 ```
 
 ### `tasks`
@@ -363,14 +378,18 @@ node dist/cli.js resume 20260522-150000-user-auth-system
   context.json
   plan.md
   patch.diff
+  environment-fix.diff
   applied.diff
   validation.log
   repair-1.diff
   repair-1.log
+  step-2-add-user-fields.diff
+  step-2-add-user-fields-environment-fix.diff
+  step-2-add-user-fields-repair-1.diff
   result.json
 ```
 
-`chat` 会保存 `transcript.json`；`plan` 和 `fix` 会按实际流程保存上下文、计划、补丁、验证日志和结果。这些文件用于调试、审查和回滚。
+`chat` 会保存 `transcript.json`；`plan` 和 `fix` 会按实际流程保存上下文、计划、补丁、验证日志和结果。普通代码修改保存 `patch.diff`，自动修复保存 `repair-N.diff`，环境修复保存 `environment-fix.diff`，多步任务保存 `step-*.diff`。这些文件用于调试、审查和回滚。
 
 ### 任务存储
 
@@ -478,6 +497,9 @@ node dist/cli.js --help
 - **Plan Mode 状态提示和快捷退出**：Plan Mode 下输入提示显示 `you [PLAN - Shift+Tab exits]`，可按 `Shift+Tab` 退出回到普通 chat。
 - **复杂任务自动检测**：chat 模式下根据关键词（auth、数据库、API、系统、全栈等）自动判断是否转入多步执行，简单任务仍走单轮流程。
 - **进度实时展示**：每步执行时显示 `[2/8] 步骤标题` 和完成状态图标（✅/❌/⏭️）。
+- **CLI Patch 对比展示**：所有结构化文件写入都会先转换为 unified diff 并在终端展示，包含单次代码修改、自动修复、环境修复和多步任务步骤。
+- **自动 patch 历史**：文件动作会保存为 `.code-agent/runs/<run>/*.diff`，`diff` 命令会列出最近运行的 patch 历史，`revert` 会回滚最近的 patch artifact。
+- **长任务环境修复判定优化**：当验证命令因本地工具、wrapper 或环境问题失败，环境修复后重试成功时，步骤会按通过处理，不再把首次环境失败残留为代码验证失败。
 
 ## v0.2 变更
 

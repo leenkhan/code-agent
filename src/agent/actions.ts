@@ -1,10 +1,13 @@
 import path from "node:path";
 import fs from "fs-extra";
+import { createTwoFilesPatch } from "diff";
 import { z } from "zod";
 import type { LlmProvider } from "../llm/provider.js";
 import type { ProjectContext } from "../types.js";
 import { assertWritableFile } from "../safety/file-policy.js";
 import { assertCommandAllowed } from "../safety/command-policy.js";
+import { applyPatch, checkPatchApplies } from "../patch/apply.js";
+import { isGitRepo } from "../tools/git.js";
 import { renderContext, extractJson } from "../utils/llm.js";
 
 const fileActionSchema = z.object({
@@ -45,6 +48,17 @@ export type CodeActionPlan = z.infer<typeof codeActionPlanSchema>;
 type CodeActionManifest = z.infer<typeof codeActionManifestSchema>;
 type ProgressUpdate = (message: string) => void;
 
+export type FileActionApplyResult = {
+  filesChanged: string[];
+  patch: string;
+  patchPath?: string;
+  appliedWithPatch: boolean;
+};
+
+export type FileActionApplyOptions = {
+  artifactDir?: string;
+  patchName?: string;
+};
 
 export function parseCodeActionPlan(text: string): CodeActionPlan {
   let json: unknown;
@@ -302,7 +316,7 @@ ${input.response}`
   return parseCodeActionPlan(repaired);
 }
 
-function resolveActionPath(root: string, relativePath: string): string {
+function normalizeActionPath(relativePath: string): string {
   if (path.isAbsolute(relativePath)) {
     throw new Error(`Absolute write path blocked: ${relativePath}`);
   }
@@ -311,6 +325,11 @@ function resolveActionPath(root: string, relativePath: string): string {
     throw new Error(`Path traversal blocked: ${relativePath}`);
   }
   assertWritableFile(normalized);
+  return normalized;
+}
+
+function resolveActionPath(root: string, relativePath: string): string {
+  const normalized = normalizeActionPath(relativePath);
   const absolute = path.resolve(root, normalized);
   const rootWithSeparator = path.resolve(root) + path.sep;
   if (absolute !== path.resolve(root) && !absolute.startsWith(rootWithSeparator)) {
@@ -341,12 +360,72 @@ export function validateCodeActionPlan(root: string, plan: CodeActionPlan): stri
   return errors;
 }
 
-export async function applyFileActions(root: string, files: FileAction[]): Promise<void> {
+export async function createFileActionsPatch(root: string, files: FileAction[]): Promise<{ patch: string; filesChanged: string[] }> {
+  const patches: string[] = [];
+  const filesChanged: string[] = [];
+
   for (const file of files) {
-    const absolute = resolveActionPath(root, file.path);
+    const normalized = normalizeActionPath(file.path);
+    const absolute = resolveActionPath(root, normalized);
+    const oldExists = await fs.pathExists(absolute);
+    const oldContent = oldExists ? await fs.readFile(absolute, "utf8") : "";
+    if (oldContent === file.content) continue;
+
+    patches.push(createTwoFilesPatch(
+      oldExists ? `a/${normalized}` : "/dev/null",
+      `b/${normalized}`,
+      oldContent,
+      file.content,
+      "",
+      "",
+      { context: 3 }
+    ));
+    filesChanged.push(normalized);
+  }
+
+  return { patch: patches.join("\n"), filesChanged };
+}
+
+function resolvePatchPath(options: FileActionApplyOptions | undefined): string | undefined {
+  if (!options?.artifactDir) return undefined;
+  const patchName = options.patchName ?? "patch.diff";
+  if (path.basename(patchName) !== patchName) {
+    throw new Error(`Patch artifact name must be a file name: ${patchName}`);
+  }
+  return path.join(options.artifactDir, patchName);
+}
+
+export async function applyFileActions(root: string, files: FileAction[], options: FileActionApplyOptions = {}): Promise<FileActionApplyResult> {
+  const { patch, filesChanged } = await createFileActionsPatch(root, files);
+  const patchPath = resolvePatchPath(options);
+  const artifactPath = patchPath && patch.trim() ? patchPath : undefined;
+  if (artifactPath) {
+    await fs.ensureDir(path.dirname(artifactPath));
+    await fs.writeFile(artifactPath, patch, "utf8");
+  }
+
+  if (filesChanged.length === 0) {
+    return { filesChanged, patch, patchPath: artifactPath, appliedWithPatch: false };
+  }
+
+  if (artifactPath && await isGitRepo(root)) {
+    const patchCheck = await checkPatchApplies(root, artifactPath);
+    if (!patchCheck.ok) {
+      throw new Error(`Generated patch cannot be applied by git:\n${patchCheck.error}`);
+    }
+    await applyPatch(root, artifactPath);
+    return { filesChanged, patch, patchPath: artifactPath, appliedWithPatch: true };
+  }
+
+  for (const file of files) {
+    const normalized = normalizeActionPath(file.path);
+    if (!filesChanged.includes(normalized)) continue;
+    const absolute = resolveActionPath(root, normalized);
     await fs.ensureDir(path.dirname(absolute));
     await fs.writeFile(absolute, file.content, "utf8");
   }
+
+  return { filesChanged, patch, patchPath: artifactPath, appliedWithPatch: false };
 }
 
 export function formatCodeActionPlan(plan: CodeActionPlan): string {

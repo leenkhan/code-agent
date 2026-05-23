@@ -44,6 +44,10 @@ export function parseChatIntent(text: string): ChatIntent {
 function inferCodeChangeIntent(message: string): ChatIntent | undefined {
   const normalized = message.toLowerCase();
   const asksForCreationOrImplementation = [
+    "增加",
+    "添加",
+    "修改",
+    "更新",
     "创建",
     "新建",
     "实现",
@@ -66,6 +70,12 @@ function inferCodeChangeIntent(message: string): ChatIntent | undefined {
     "框架",
     "代码",
     "接口",
+    "注册",
+    "验证码",
+    "找回密码",
+    "邮箱",
+    "邮件",
+    "密码",
     "springboot",
     "spring boot",
     "kotlin",

@@ -320,17 +320,20 @@ export function detectValidationCommandsFromProfile(profile: ProjectProfile, fil
 }
 
 export function normalizeVerificationCommand(profile: ProjectProfile, command: string): string {
-  if (command.includes("./mvnw")) {
+  let normalizedCommand = command
+    .replace(/(^|[\s;&|()])(?:\.\.\/)+mvnw(?=\s|$)/g, "$1./mvnw")
+    .replace(/(^|[\s;&|()])(?:\.\.\/)+gradlew(?=\s|$)/g, "$1./gradlew");
+  if (normalizedCommand.includes("./mvnw")) {
     return profile.wrapperCommands.includes("./mvnw") && profile.importantFiles.includes(".mvn/wrapper/maven-wrapper.jar")
-      ? command
-      : command.replace(/(^|[\s;&|()])\.\/mvnw(?=\s|$)/g, "$1mvn");
+      ? normalizedCommand
+      : normalizedCommand.replace(/(^|[\s;&|()])\.\/mvnw(?=\s|$)/g, "$1mvn");
   }
-  if (command.includes("./gradlew")) {
+  if (normalizedCommand.includes("./gradlew")) {
     return profile.wrapperCommands.includes("./gradlew")
-      ? command
-      : command.replace(/(^|[\s;&|()])\.\/gradlew(?=\s|$)/g, "$1gradle");
+      ? normalizedCommand
+      : normalizedCommand.replace(/(^|[\s;&|()])\.\/gradlew(?=\s|$)/g, "$1gradle");
   }
-  return command;
+  return normalizedCommand;
 }
 
 export function isLongRunningCommandForProfile(command: string, profile?: ProjectProfile): boolean {

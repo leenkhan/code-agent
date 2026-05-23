@@ -99,6 +99,32 @@ describe("classifyChatIntent", () => {
     expect(provider.generateText).not.toHaveBeenCalled();
   });
 
+  it("routes Chinese add endpoint requests with verification-code wording to code_change", async () => {
+    const provider: LlmProvider = {
+      generateText: vi.fn(async () => JSON.stringify({
+        intent: "task_goal",
+        task: "wrong",
+        reason: "wrong"
+      }))
+    };
+
+    const message = "增加验证码找回密码的接口";
+    const result = await classifyChatIntent({
+      provider,
+      model: "test",
+      message,
+      history: [],
+      context: { root: "/tmp", fileTree: [], importantFiles: [] }
+    });
+
+    expect(result).toEqual({
+      intent: "code_change",
+      task: message,
+      reason: "The user asked to create or implement project code; any requested run/test steps should happen after file generation."
+    });
+    expect(provider.generateText).not.toHaveBeenCalled();
+  });
+
   it("routes composite run-and-test goals to task runtime before asking the provider", async () => {
     const provider: LlmProvider = {
       generateText: vi.fn(async () => JSON.stringify({

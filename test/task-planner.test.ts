@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { buildOperationalFallbackPlan, normalizeTaskPlanForContext, parseTaskPlan } from "../src/agent/task-planner.js";
+import { buildOperationalFallbackPlan, generateTaskPlan, normalizeTaskPlanForContext, parseTaskPlan } from "../src/agent/task-planner.js";
+import type { LlmProvider } from "../src/llm/provider.js";
 
 describe("parseTaskPlan", () => {
   it("parses a valid task plan", () => {
@@ -167,5 +168,78 @@ describe("buildOperationalFallbackPlan", () => {
 
     expect(plan.steps[0].verification).toBe("mvn compile test-compile -DskipTests");
     expect(plan.steps[1].verification).toBe("mvn spring-boot:run & sleep 15 && lsof -i :8080");
+  });
+
+  it("normalizes parent-directory Maven wrapper commands to the project root", () => {
+    const plan = normalizeTaskPlanForContext({
+      goal: "构建代码",
+      steps: [{
+        id: "1",
+        title: "Compile",
+        description: "Compile",
+        expectedFiles: [],
+        verification: "../mvnw compile",
+        milestone: false
+      }]
+    }, {
+      root: "/tmp/project",
+      fileTree: ["pom.xml", "mvnw", ".mvn/wrapper/maven-wrapper.jar"],
+      importantFiles: []
+    });
+
+    expect(plan.steps[0].verification).toBe("./mvnw compile");
+  });
+
+  it("inserts an implementation step when a feature plan only contains verification", async () => {
+    const provider: LlmProvider = {
+      async generateText() {
+        return JSON.stringify({
+          goal: "修改注册逻辑，增加邮件验证码确认真实 email 地址的接口",
+          steps: [{
+            id: "1",
+            title: "Build and test with Maven",
+            description: "Run Maven tests",
+            expectedFiles: [],
+            verification: "../mvnw test",
+            milestone: false
+          }]
+        });
+      }
+    };
+
+    const plan = await generateTaskPlan({
+      provider,
+      model: "test",
+      goal: "修改注册逻辑，增加邮件验证码确认真实 email 地址的接口",
+      context: {
+        root: "/tmp/project",
+        fileTree: [
+          "pom.xml",
+          "mvnw",
+          ".mvn/wrapper/maven-wrapper.jar",
+          "src/main/java/com/example/demo/model/User.java",
+          "src/main/java/com/example/demo/controller/AuthController.java",
+          "src/main/java/com/example/demo/service/UserService.java",
+          "src/main/java/com/example/demo/config/SecurityConfig.java"
+        ],
+        importantFiles: []
+      }
+    });
+
+    expect(plan.steps[0]).toEqual(expect.objectContaining({
+      title: "Implement requested code changes",
+      verification: "./mvnw test"
+    }));
+    expect(plan.steps[0].expectedFiles).toEqual(expect.arrayContaining([
+      "src/main/java/com/example/demo/controller/AuthController.java",
+      "src/main/java/com/example/demo/service/UserService.java",
+      "src/main/java/com/example/demo/model/User.java"
+    ]));
+    expect(plan.steps[1]).toEqual(expect.objectContaining({
+      title: "Verify implementation",
+      expectedFiles: [],
+      verification: "./mvnw test",
+      dependsOn: ["1"]
+    }));
   });
 });

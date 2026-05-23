@@ -110,7 +110,7 @@ Return JSON with this exact shape:
 Order steps so each one builds on the previous. Include dependsOn only when a step genuinely cannot start before another completes.`
     });
 
-    return normalizeTaskPlanForContext(parseTaskPlan(response), input.context);
+    return normalizeTaskPlanForContext(ensureImplementationPlan(parseTaskPlan(response), input.context, input.goal), input.context);
   } catch (error) {
     const fallback = buildOperationalFallbackPlan(input.goal, input.context);
     if (fallback) return normalizeTaskPlanForContext(fallback, input.context);
@@ -127,6 +127,98 @@ export function normalizeTaskPlanForContext(plan: TaskPlan, context: ProjectCont
       verification: normalizeVerificationCommand(profile, step.verification)
     }))
   };
+}
+
+function ensureImplementationPlan(plan: TaskPlan, context: ProjectContext, requestedGoal: string): TaskPlan {
+  const goalText = `${requestedGoal}\n${plan.goal}`;
+  if (!isImplementationGoal(goalText)) return plan;
+  if (plan.steps.some((step) => step.expectedFiles.length > 0)) return plan;
+
+  const profile = context.profile ?? buildProjectProfile(context.fileTree);
+  const verification = plan.steps.find((step) => step.verification.trim())?.verification
+    ?? validationCommandsForProfile(profile, "verify")[0]
+    ?? "";
+  const expectedFiles = inferImplementationFiles(plan.goal, context);
+
+  const implementationStep: TaskStep = {
+    id: "1",
+    title: "Implement requested code changes",
+    description: `Modify the project code to satisfy this feature request: ${requestedGoal}`,
+    expectedFiles,
+    verification,
+    milestone: isMilestoneStep({
+      id: "1",
+      title: plan.goal,
+      description: plan.goal,
+      expectedFiles,
+      verification
+    })
+  };
+
+  const verificationStep: TaskStep | undefined = verification
+    ? {
+      id: "2",
+      title: "Verify implementation",
+      description: "Run the project validation command after applying the code changes.",
+      expectedFiles: [],
+      verification,
+      milestone: false,
+      dependsOn: ["1"]
+    }
+    : undefined;
+
+  return {
+    ...plan,
+    steps: verificationStep ? [implementationStep, verificationStep] : [implementationStep]
+  };
+}
+
+function isImplementationGoal(goal: string): boolean {
+  const normalized = goal.toLowerCase();
+  const changeWords = [
+    "增加", "添加", "修改", "更新", "实现", "新增",
+    "add", "modify", "update", "implement", "create"
+  ];
+  const targetWords = [
+    "接口", "api", "endpoint", "注册", "登录", "认证", "邮箱", "邮件", "email",
+    "验证码", "找回密码", "密码", "password", "controller", "service", "entity"
+  ];
+  return changeWords.some((word) => normalized.includes(word))
+    && targetWords.some((word) => normalized.includes(word));
+}
+
+function inferImplementationFiles(goal: string, context: ProjectContext): string[] {
+  const normalizedGoal = goal.toLowerCase();
+  const sourceFiles = context.fileTree.filter((file) => /\.(ts|tsx|js|jsx|java|kt|py|go|rs|php|rb|cs)$/i.test(file));
+  const priorityWords = [
+    "auth",
+    "user",
+    "security",
+    "controller",
+    "service",
+    "repository",
+    "model",
+    "entity",
+    "login",
+    "register",
+    "password",
+    "email"
+  ];
+  const chineseIntent = ["注册", "登录", "认证", "验证码", "找回密码", "邮箱", "邮件", "密码", "接口"]
+    .some((word) => normalizedGoal.includes(word));
+  const scored = sourceFiles
+    .map((file) => {
+      const lower = file.toLowerCase();
+      const score = priorityWords.reduce((sum, word) => sum + (lower.includes(word) ? 1 : 0), 0)
+        + (chineseIntent && /(?:auth|user|security|controller|service|repository|model|entity)/i.test(file) ? 2 : 0);
+      return { file, score };
+    })
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score || a.file.localeCompare(b.file))
+    .map((entry) => entry.file);
+
+  if (scored.length > 0) return scored.slice(0, 8);
+  return sourceFiles.slice(0, 5);
 }
 
 export function buildOperationalFallbackPlan(goal: string, context: ProjectContext): TaskPlan | undefined {

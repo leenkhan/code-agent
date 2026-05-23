@@ -73,6 +73,7 @@ async function main(): Promise<void> {
     const { resolveRuntimeConfig } = await import("./state/config.js");
     const { createLlmProvider } = await import("./llm/factory.js");
     const { loadTaskStore, listTasks } = await import("./state/task-store.js");
+    const { createRunStore } = await import("./state/run-store.js");
     const { executeTask } = await import("./agent/task-executor.js");
 
     const config = await resolveRuntimeConfig(root, {});
@@ -122,13 +123,15 @@ async function main(): Promise<void> {
       logger.info(`Next action: ${state.lastFailure.nextAction}`);
     }
     const totalSteps = normalizedPlan.steps.length;
+    const runStore = await createRunStore(root, `resume ${resolvedTaskId}`);
     const generator = executeTask({
       root,
       config: { ...config, autoApply: true },
       provider,
       plan: normalizedPlan,
       state: { ...state, currentStepIndex: resumeIndex, status: "running" },
-      store: taskStore
+      store: taskStore,
+      patchArtifactDir: runStore.dir
     });
 
     for await (const event of generator) {
@@ -138,6 +141,10 @@ async function main(): Promise<void> {
           break;
         case "step_files_written":
           logger.success(`Files: ${event.files.join(", ")}`);
+          break;
+        case "step_patch":
+          logger.heading(`Patch: ${event.patchName}`);
+          logger.info(event.patch);
           break;
         case "step_repair":
           logger.warn(`Repair attempt ${event.attempt}/${event.maxAttempts}...`);
@@ -165,11 +172,16 @@ async function main(): Promise<void> {
             provider,
             plan: normalizedPlan,
             state: { ...updatedState, currentStepIndex: resolveResumeStepIndex(normalizedPlan, updatedState), status: "running" },
-            store: taskStore
+            store: taskStore,
+            patchArtifactDir: runStore.dir
           });
           for await (const ev of nextGen) {
             if (ev.kind === "step_started") logger.heading(`[${ev.stepId}/${totalSteps}] ${ev.stepTitle}`);
             else if (ev.kind === "step_files_written") logger.success(`Files: ${ev.files.join(", ")}`);
+            else if (ev.kind === "step_patch") {
+              logger.heading(`Patch: ${ev.patchName}`);
+              logger.info(ev.patch);
+            }
             else if (ev.kind === "step_repair") logger.warn(`Repair attempt ${ev.attempt}/${ev.maxAttempts}...`);
             else if (ev.kind === "step_command_deferred") {
               logger.warn(`Command requires confirmation: ${ev.command}`);

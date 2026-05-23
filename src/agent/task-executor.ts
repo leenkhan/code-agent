@@ -1,7 +1,7 @@
 import type { LlmProvider } from "../llm/provider.js";
 import type { RuntimeConfig, TaskFailure, TaskPlan, TaskState, StepResult, ValidationResult } from "../types.js";
 import { collectProjectContext } from "../project/context.js";
-import { generateCodeActionPlan, applyFileActions, validateCodeActionPlan, generateEnvironmentFix, type CodeActionPlan } from "./actions.js";
+import { generateCodeActionPlan, applyFileActions, createFileActionsPatch, validateCodeActionPlan, generateEnvironmentFix, type CodeActionPlan } from "./actions.js";
 import { runValidationCommand } from "../tools/run-command.js";
 import { isLongRunningCommand, isLongRunningCommandForProject } from "../tools/background-command.js";
 import { requiresInstallConfirmation } from "../safety/command-policy.js";
@@ -14,6 +14,7 @@ export type ExecutorEvent =
   | { kind: "step_started"; stepIndex: number; stepId: string; stepTitle: string; totalSteps: number }
   | { kind: "step_progress"; stepIndex: number; message: string }
   | { kind: "step_code_plan"; stepIndex: number; summary: string }
+  | { kind: "step_patch"; stepIndex: number; patchName: string; patch: string; files: string[] }
   | { kind: "step_files_written"; stepIndex: number; files: string[] }
   | { kind: "step_verification"; stepIndex: number; results: ValidationResult[] }
   | { kind: "step_repair"; stepIndex: number; attempt: number; maxAttempts: number }
@@ -32,8 +33,9 @@ export async function* executeTask(params: {
   plan: TaskPlan;
   state: TaskState;
   store: TaskStore;
+  patchArtifactDir?: string;
 }): AsyncGenerator<ExecutorEvent> {
-  const { root, config, provider, plan, state, store } = params;
+  const { root, config, provider, plan, state, store, patchArtifactDir } = params;
   const initialContext = await collectProjectContext(root, config, plan.goal);
   const projectProfile = initialContext.profile ?? buildProjectProfile(initialContext.fileTree);
 
@@ -116,7 +118,15 @@ export async function* executeTask(params: {
     // Write files
     const filesChanged: string[] = [];
     if (actionPlan.files.length > 0) {
-      await applyFileActions(root, actionPlan.files);
+      const patchName = `step-${i + 1}-${step.id}.diff`;
+      const patchPreview = await createFileActionsPatch(root, actionPlan.files);
+      if (patchPreview.patch.trim()) {
+        yield { kind: "step_patch", stepIndex: i, patchName, patch: patchPreview.patch, files: patchPreview.filesChanged };
+      }
+      await applyFileActions(root, actionPlan.files, {
+        artifactDir: patchArtifactDir,
+        patchName
+      });
       filesChanged.push(...actionPlan.files.map((f) => f.path));
       yield { kind: "step_files_written", stepIndex: i, files: filesChanged };
     }
@@ -144,7 +154,6 @@ export async function* executeTask(params: {
         return;
       }
       const result = await runValidationCommand(root, cmd.command);
-      validationResults.push(result);
 
       const envIssue = classifyEnvironmentFailures([result], activeProfile);
       if (envIssue) {
@@ -163,7 +172,15 @@ export async function* executeTask(params: {
 
           if (fix && (fix.files.length > 0 || fix.commands.length > 0)) {
             if (fix.files.length > 0) {
-              await applyFileActions(root, fix.files);
+              const patchName = `step-${i + 1}-${step.id}-environment-fix.diff`;
+              const patchPreview = await createFileActionsPatch(root, fix.files);
+              if (patchPreview.patch.trim()) {
+                yield { kind: "step_patch", stepIndex: i, patchName, patch: patchPreview.patch, files: patchPreview.filesChanged };
+              }
+              await applyFileActions(root, fix.files, {
+                artifactDir: patchArtifactDir,
+                patchName
+              });
               for (const f of fix.files) {
                 if (f.path.endsWith("gradlew") || f.path.endsWith("mvnw")) {
                   try { await runValidationCommand(root, `chmod +x ${f.path}`); } catch { /* ok */ }
@@ -181,13 +198,19 @@ export async function* executeTask(params: {
               validationResults.push(retryResult);
               continue; // Success — continue to next command
             }
+            validationResults.push(retryResult);
           }
         }
 
+        if (!validationResults.includes(result)) {
+          validationResults.push(result);
+        }
         environmentIssue = true;
         await blockTaskForEnvironmentIssue(store, state, step.id, i, result, envIssue);
         break;
       }
+
+      validationResults.push(result);
     }
 
     yield { kind: "step_verification", stepIndex: i, results: validationResults };
@@ -225,7 +248,15 @@ export async function* executeTask(params: {
         if (repairErrors.length > 0) break;
 
         if (repairPlan.files.length > 0) {
-          await applyFileActions(root, repairPlan.files);
+          const patchName = `step-${i + 1}-${step.id}-repair-${attempt + 1}.diff`;
+          const patchPreview = await createFileActionsPatch(root, repairPlan.files);
+          if (patchPreview.patch.trim()) {
+            yield { kind: "step_patch", stepIndex: i, patchName, patch: patchPreview.patch, files: patchPreview.filesChanged };
+          }
+          await applyFileActions(root, repairPlan.files, {
+            artifactDir: patchArtifactDir,
+            patchName
+          });
           for (const f of repairPlan.files) {
             if (!filesChanged.includes(f.path)) filesChanged.push(f.path);
           }
@@ -339,6 +370,25 @@ function buildCommandOnlyActionPlan(step: TaskPlan["steps"][number], goal: strin
 
 function isOperationalGoal(goal: string): boolean {
   const normalized = goal.toLowerCase();
+  const implementationKeywords = [
+    "验证码",
+    "增加",
+    "添加",
+    "修改",
+    "实现",
+    "接口",
+    "注册",
+    "登录",
+    "找回密码",
+    "email",
+    "邮箱",
+    "邮件",
+    "password",
+    "endpoint",
+    "api"
+  ];
+  if (implementationKeywords.some((keyword) => normalized.includes(keyword))) return false;
+
   return [
     "启动服务",
     "运行服务",

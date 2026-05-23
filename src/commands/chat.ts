@@ -5,7 +5,7 @@ import fs from "fs-extra";
 import ora from "ora";
 import { generateChatReply, type ChatMessage } from "../agent/chat.js";
 import { classifyChatIntent } from "../agent/intent.js";
-import { applyFileActions, formatCodeActionPlan, generateCodeActionPlan, validateCodeActionPlan, generateEnvironmentFix } from "../agent/actions.js";
+import { applyFileActions, createFileActionsPatch, formatCodeActionPlan, generateCodeActionPlan, validateCodeActionPlan, generateEnvironmentFix } from "../agent/actions.js";
 import { executePlanOnly } from "../agent/runtime.js";
 import { generateTaskPlan, normalizeTaskPlanForContext } from "../agent/task-planner.js";
 import { executeTask, resolveResumeStepIndex, type ExecutorEvent } from "../agent/task-executor.js";
@@ -132,6 +132,12 @@ function formatRunningCommands(commands: RunningCommand[]): string {
   return active
     .map((command) => `- id=${command.id}, command=${command.command}, pid=${command.process.pid ?? "unknown"}`)
     .join("\n");
+}
+
+function printPatchPreview(name: string, patch: string): void {
+  if (!patch.trim()) return;
+  logger.heading(`Patch: ${name}`);
+  logger.info(patch);
 }
 
 function isReadOnlyProjectQuestion(message: string): boolean {
@@ -788,7 +794,7 @@ async function runComplexTask(params: {
     return;
   }
 
-  const generator = executeTask({ root, config, provider, plan, state, store });
+  const generator = executeTask({ root, config, provider, plan, state, store, patchArtifactDir: runStore.dir });
 
   try {
     for await (const event of generator) {
@@ -799,6 +805,10 @@ async function runComplexTask(params: {
         }
         case "step_code_plan": {
           logger.info(`Plan: ${event.summary}`);
+          break;
+        }
+        case "step_patch": {
+          printPatchPreview(event.patchName, event.patch);
           break;
         }
         case "step_files_written": {
@@ -852,11 +862,12 @@ async function runComplexTask(params: {
           const nextGenerator = executeTask({
             root, config, provider, plan,
             state: { ...updatedState, currentStepIndex: resolveResumeStepIndex(plan, updatedState), status: "running" },
-            store
+            store,
+            patchArtifactDir: runStore.dir
           });
           // Continue processing events from the new generator
           // We use a nested loop with a flag
-          await continueTaskExecution(nextGenerator, root, config, provider, plan, store, history);
+          await continueTaskExecution(nextGenerator, root, config, provider, plan, store, history, runStore.dir);
           return;
         }
         case "paused": {
@@ -899,7 +910,8 @@ async function continueTaskExecution(
   provider: import("../llm/provider.js").LlmProvider,
   plan: TaskPlan,
   store: import("../state/task-store.js").TaskStore,
-  history: ChatMessage[]
+  history: ChatMessage[],
+  patchArtifactDir?: string
 ): Promise<void> {
   const totalSteps = plan.steps.length;
   for await (const event of generator) {
@@ -909,6 +921,9 @@ async function continueTaskExecution(
         break;
       case "step_code_plan":
         logger.info(`Plan: ${event.summary}`);
+        break;
+      case "step_patch":
+        printPatchPreview(event.patchName, event.patch);
         break;
       case "step_files_written":
         logger.success(`Files: ${event.files.join(", ")}`);
@@ -950,9 +965,10 @@ async function continueTaskExecution(
         const nextGen = executeTask({
           root, config, provider, plan,
           state: { ...updatedState, currentStepIndex: resolveResumeStepIndex(plan, updatedState), status: "running" },
-          store
+          store,
+          patchArtifactDir
         });
-        await continueTaskExecution(nextGen, root, config, provider, plan, store, history);
+        await continueTaskExecution(nextGen, root, config, provider, plan, store, history, patchArtifactDir);
         return;
       }
       case "paused":
@@ -989,8 +1005,9 @@ async function runRepairLoop(params: {
   history: ChatMessage[];
   runningCommands: RunningCommand[];
   task: string;
+  patchArtifactDir?: string;
 }): Promise<void> {
-  const { root, config, provider, history, runningCommands, task } = params;
+  const { root, config, provider, history, runningCommands, task, patchArtifactDir } = params;
   let failedResults: ValidationResult[] = [{ command: task, exitCode: 1, stdout: "", stderr: "", durationMs: 0 }];
 
   for (let attempt = 0; attempt < config.maxRepairAttempts && failedResults.length > 0; attempt++) {
@@ -1026,6 +1043,8 @@ async function runRepairLoop(params: {
 
     logger.heading(`Repair ${attempt + 1}/${config.maxRepairAttempts}`);
     logger.info(formatCodeActionPlan(repairPlan));
+    const repairPatch = await createFileActionsPatch(root, repairPlan.files);
+    printPatchPreview(`repair-${attempt + 1}.diff`, repairPatch.patch);
 
     if (!(config.autoApply || await askConfirm("Apply this repair?", true))) {
       logger.info("Repair skipped.");
@@ -1034,7 +1053,10 @@ async function runRepairLoop(params: {
     }
 
     if (repairPlan.files.length > 0) {
-      await applyFileActions(root, repairPlan.files);
+      await applyFileActions(root, repairPlan.files, {
+        artifactDir: patchArtifactDir,
+        patchName: `repair-${attempt + 1}.diff`
+      });
       logger.success("Repair files written.");
       history.push({ role: "assistant", content: `已修复文件：${repairPlan.files.map((f) => f.path).join(", ")}` });
     }
@@ -1382,8 +1404,13 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
         await store.writeJson("transcript.json", history);
         continue;
       }
+      const patchPreview = await createFileActionsPatch(root, actionPlan.files);
+      printPatchPreview("patch.diff", patchPreview.patch);
       if (actionPlan.files.length > 0 && (config.autoApply || await askConfirm("Write these files now?", false))) {
-        await applyFileActions(root, actionPlan.files);
+        await applyFileActions(root, actionPlan.files, {
+          artifactDir: store.dir,
+          patchName: "patch.diff"
+        });
         logger.success("Files written.");
         history.push({ role: "assistant", content: `已写入文件：${actionPlan.files.map((file) => file.path).join(", ")}` });
       } else if (actionPlan.files.length > 0) {
@@ -1415,13 +1442,13 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
             await runChatCommand(root, cmd.command, runningCommands, history);
           } else {
             const result = await withProgress(`Running command: ${cmd.command}`, () => runValidationCommand(root, cmd.command));
-            validationResults.push(result);
             const output = formatCompactCommandResult(result);
             logger.heading("Command result");
             logger.info(output);
             history.push({ role: "assistant", content: output });
             environmentIssue = analyzeEnvironmentFailures([result]);
             if (environmentIssue) {
+              let recordedEnvironmentFailure = false;
               const message = formatEnvironmentIssue(environmentIssue);
               logger.heading("Environment issue");
               logger.warn(message);
@@ -1445,7 +1472,12 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
                   logger.heading("Generated environment fix");
                   if (fix.files.length > 0) {
                     logger.info(`Files: ${fix.files.map((f) => f.path).join(", ")}`);
-                    await applyFileActions(root, fix.files);
+                    const fixPatch = await createFileActionsPatch(root, fix.files);
+                    printPatchPreview("environment-fix.diff", fixPatch.patch);
+                    await applyFileActions(root, fix.files, {
+                      artifactDir: store.dir,
+                      patchName: "environment-fix.diff"
+                    });
                     for (const f of fix.files) {
                       // Make shell scripts executable
                       if (f.path.endsWith("gradlew") || f.path.endsWith("mvnw")) {
@@ -1472,15 +1504,22 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
 
                   if (retryResult.exitCode === 0) {
                     environmentIssue = undefined;
+                    stopFurtherCommands = false;
                     validationResults.push(retryResult);
                     continue; // Success — continue to next command
                   }
+                  validationResults.push(retryResult);
+                  recordedEnvironmentFailure = true;
                 }
               } else {
                 logger.info("Environment fix skipped: the service must be started before endpoint checks can run.");
               }
+              if (!recordedEnvironmentFailure) {
+                validationResults.push(result);
+              }
               break;
             }
+            validationResults.push(result);
           }
         } else {
           logger.info(`Skipped command: ${cmd.command}`);
@@ -1503,7 +1542,8 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
           provider,
           history,
           runningCommands,
-          task: `Original task: ${intent.task}\n\nCommand errors:\n${errorSummary}`
+          task: `Original task: ${intent.task}\n\nCommand errors:\n${errorSummary}`,
+          patchArtifactDir: store.dir
         });
       }
 
@@ -1635,7 +1675,8 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
                   provider,
                   history,
                   runningCommands,
-                  task: repairTask
+                  task: repairTask,
+                  patchArtifactDir: store.dir
                 });
               }
             }
