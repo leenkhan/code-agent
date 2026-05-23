@@ -14,7 +14,7 @@ describe("package metadata", () => {
     };
 
     expect(packageJson.name).toBe("@codeshit/cli");
-    expect(packageJson.version).toBe("0.3.1-beta.2");
+    expect(packageJson.version).toBe("0.3.1-beta.3");
     expect(appVersion).toBe(packageJson.version);
     expect(packageJson.bin).toEqual({ codeshit: "dist/cli.js" });
     expect(packageJson.bin["code-agent"]).toBeUndefined();
