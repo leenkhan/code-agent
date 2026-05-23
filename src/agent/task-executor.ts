@@ -26,6 +26,13 @@ export type ExecutorEvent =
   | { kind: "completed"; state: TaskState }
   | { kind: "failed"; state: TaskState; error: string };
 
+export type ExecutorConfirmation =
+  | { kind: "apply_patch"; stepIndex: number; stepId: string; patchName: string; patch: string; files: string[] }
+  | { kind: "run_command"; stepIndex: number; stepId: string; command: string; reason?: string }
+  | { kind: "continue_validation"; stepIndex: number; stepId: string; progress: string };
+
+export type ExecutorConfirmationResult = "proceed" | "skip" | "defer" | "cancel";
+
 export async function* executeTask(params: {
   root: string;
   config: RuntimeConfig;
@@ -34,8 +41,9 @@ export async function* executeTask(params: {
   state: TaskState;
   store: TaskStore;
   patchArtifactDir?: string;
+  confirm?: (confirmation: ExecutorConfirmation) => Promise<ExecutorConfirmationResult>;
 }): AsyncGenerator<ExecutorEvent> {
-  const { root, config, provider, plan, state, store, patchArtifactDir } = params;
+  const { root, config, provider, plan, state, store, patchArtifactDir, confirm } = params;
   const initialContext = await collectProjectContext(root, config, plan.goal);
   const projectProfile = initialContext.profile ?? buildProjectProfile(initialContext.fileTree);
 
@@ -123,6 +131,19 @@ export async function* executeTask(params: {
       if (patchPreview.patch.trim()) {
         yield { kind: "step_patch", stepIndex: i, patchName, patch: patchPreview.patch, files: patchPreview.filesChanged };
       }
+      const patchDecision = await confirmExecutorAction(confirm, config.autoApply, {
+        kind: "apply_patch",
+        stepIndex: i,
+        stepId: step.id,
+        patchName,
+        patch: patchPreview.patch,
+        files: patchPreview.filesChanged
+      });
+      if (patchDecision !== "proceed") {
+        await pauseTaskForDecision(store, state, step.id, i, patchDecision, `Apply patch ${patchName}`);
+        yield { kind: "paused", reason: state.blockedReason ?? "Task paused before applying patch.", state };
+        return;
+      }
       await applyFileActions(root, actionPlan.files, {
         artifactDir: patchArtifactDir,
         patchName
@@ -140,6 +161,18 @@ export async function* executeTask(params: {
         const reason = isLongRunningCommandForProject(cmd.command, activeProfile)
           ? "Long-running commands require caller confirmation and background handling."
           : "Install commands require caller confirmation before continuing.";
+        const decision = await confirmExecutorAction(confirm, config.autoApply, {
+          kind: "run_command",
+          stepIndex: i,
+          stepId: step.id,
+          command: cmd.command,
+          reason
+        });
+        if (decision === "proceed") {
+          const result = await runValidationCommand(root, cmd.command);
+          validationResults.push(result);
+          continue;
+        }
         yield { kind: "step_command_deferred", stepIndex: i, command: cmd.command, reason };
         await pauseTask(store, state, {
           stepId: step.id,
@@ -151,6 +184,18 @@ export async function* executeTask(params: {
           nextAction: `Confirm and run "${cmd.command}", then resume from step ${i + 1}.`
         });
         yield { kind: "paused", reason: state.blockedReason ?? "Task paused for command confirmation.", state };
+        return;
+      }
+      const commandDecision = await confirmExecutorAction(confirm, config.autoApply, {
+        kind: "run_command",
+        stepIndex: i,
+        stepId: step.id,
+        command: cmd.command,
+        reason: cmd.reason
+      });
+      if (commandDecision !== "proceed") {
+        await pauseTaskForDecision(store, state, step.id, i, commandDecision, `Run "${cmd.command}"`);
+        yield { kind: "paused", reason: state.blockedReason ?? "Task paused before running command.", state };
         return;
       }
       const result = await runValidationCommand(root, cmd.command);
@@ -176,6 +221,19 @@ export async function* executeTask(params: {
               const patchPreview = await createFileActionsPatch(root, fix.files);
               if (patchPreview.patch.trim()) {
                 yield { kind: "step_patch", stepIndex: i, patchName, patch: patchPreview.patch, files: patchPreview.filesChanged };
+              }
+              const fixDecision = await confirmExecutorAction(confirm, config.autoApply, {
+                kind: "apply_patch",
+                stepIndex: i,
+                stepId: step.id,
+                patchName,
+                patch: patchPreview.patch,
+                files: patchPreview.filesChanged
+              });
+              if (fixDecision !== "proceed") {
+                await pauseTaskForDecision(store, state, step.id, i, fixDecision, `Apply environment fix ${patchName}`);
+                yield { kind: "paused", reason: state.blockedReason ?? "Task paused before applying environment fix.", state };
+                return;
               }
               await applyFileActions(root, fix.files, {
                 artifactDir: patchArtifactDir,
@@ -253,6 +311,19 @@ export async function* executeTask(params: {
           if (patchPreview.patch.trim()) {
             yield { kind: "step_patch", stepIndex: i, patchName, patch: patchPreview.patch, files: patchPreview.filesChanged };
           }
+          const repairDecision = await confirmExecutorAction(confirm, config.autoApply, {
+            kind: "apply_patch",
+            stepIndex: i,
+            stepId: step.id,
+            patchName,
+            patch: patchPreview.patch,
+            files: patchPreview.filesChanged
+          });
+          if (repairDecision !== "proceed") {
+            await pauseTaskForDecision(store, state, step.id, i, repairDecision, `Apply repair ${patchName}`);
+            yield { kind: "paused", reason: state.blockedReason ?? "Task paused before applying repair.", state };
+            return;
+          }
           await applyFileActions(root, repairPlan.files, {
             artifactDir: patchArtifactDir,
             patchName
@@ -265,6 +336,18 @@ export async function* executeTask(params: {
         const newResults: ValidationResult[] = [];
         for (const cmd of repairPlan.commands) {
           if (!isLongRunningCommandForProject(cmd.command, activeProfile) && !requiresInstallConfirmation(cmd.command)) {
+            const repairCommandDecision = await confirmExecutorAction(confirm, config.autoApply, {
+              kind: "run_command",
+              stepIndex: i,
+              stepId: step.id,
+              command: cmd.command,
+              reason: cmd.reason
+            });
+            if (repairCommandDecision !== "proceed") {
+              await pauseTaskForDecision(store, state, step.id, i, repairCommandDecision, `Run repair command "${cmd.command}"`);
+              yield { kind: "paused", reason: state.blockedReason ?? "Task paused before running repair command.", state };
+              return;
+            }
             const result = await runValidationCommand(root, cmd.command);
             newResults.push(result);
           }
@@ -319,9 +402,20 @@ export async function* executeTask(params: {
     if (step.milestone === true && i < plan.steps.length - 1) {
       const progress = buildProgressSummary(plan, state);
       yield { kind: "milestone", stepIndex: i, result: stepResult, progress };
+      const continueDecision = await confirmExecutorAction(confirm, config.autoApply, {
+        kind: "continue_validation",
+        stepIndex: i,
+        stepId: step.id,
+        progress
+      });
+      if (continueDecision === "proceed") {
+        continue;
+      }
       state.status = "paused";
       state.currentStepIndex = i;
-      state.blockedReason = `Milestone reached after step ${step.id}.`;
+      state.blockedReason = continueDecision === "skip"
+        ? `Milestone skipped after step ${step.id}.`
+        : `Milestone reached after step ${step.id}.`;
       state.lastFailure = undefined;
       state.updatedAt = new Date().toISOString();
       await store.writeState(state);
@@ -333,6 +427,15 @@ export async function* executeTask(params: {
   state.updatedAt = new Date().toISOString();
   await store.writeState(state);
   yield { kind: "completed", state };
+}
+
+async function confirmExecutorAction(
+  confirm: ((confirmation: ExecutorConfirmation) => Promise<ExecutorConfirmationResult>) | undefined,
+  autoApply: boolean,
+  confirmation: ExecutorConfirmation
+): Promise<ExecutorConfirmationResult> {
+  if (autoApply || !confirm) return "proceed";
+  return confirm(confirmation);
 }
 
 export function resolveResumeStepIndex(plan: TaskPlan, state: TaskState): number {
@@ -426,6 +529,29 @@ async function pauseTask(
   state.knownFailures.push(failure.summary);
   state.updatedAt = lastFailure.occurredAt;
   await store.writeState(state);
+}
+
+async function pauseTaskForDecision(
+  store: TaskStore,
+  state: TaskState,
+  stepId: string,
+  stepIndex: number,
+  decision: ExecutorConfirmationResult,
+  action: string
+): Promise<void> {
+  const summary = decision === "skip"
+    ? `${action} was skipped.`
+    : decision === "defer"
+      ? `${action} was deferred.`
+      : `${action} was cancelled.`;
+  await pauseTask(store, state, {
+    stepId,
+    stepIndex,
+    summary,
+    details: [`User selected "${decision}" for: ${action}`],
+    suggestions: ["Use /resume after deciding how to continue this task."],
+    nextAction: `Resume this task to revisit: ${action}.`
+  });
 }
 
 async function blockTaskForEnvironmentIssue(

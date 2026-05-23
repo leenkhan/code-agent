@@ -1,6 +1,4 @@
-import { input } from "@inquirer/prompts";
 import path from "node:path";
-import readline from "node:readline";
 import fs from "fs-extra";
 import ora from "ora";
 import { generateChatReply, type ChatMessage } from "../agent/chat.js";
@@ -8,7 +6,7 @@ import { classifyChatIntent } from "../agent/intent.js";
 import { applyFileActions, createFileActionsPatch, formatCodeActionPlan, generateCodeActionPlan, validateCodeActionPlan, generateEnvironmentFix } from "../agent/actions.js";
 import { executePlanOnly } from "../agent/runtime.js";
 import { generateTaskPlan, normalizeTaskPlanForContext } from "../agent/task-planner.js";
-import { executeTask, resolveResumeStepIndex, type ExecutorEvent } from "../agent/task-executor.js";
+import { executeTask, resolveResumeStepIndex, type ExecutorConfirmation, type ExecutorConfirmationResult, type ExecutorEvent } from "../agent/task-executor.js";
 import { createLlmProvider } from "../llm/factory.js";
 import { collectProjectContext } from "../project/context.js";
 import { resolveRuntimeConfig } from "../state/config.js";
@@ -27,10 +25,12 @@ import {
 } from "../tools/background-command.js";
 import { runValidationCommand } from "../tools/run-command.js";
 import { formatExternalServices, listExternalServices, parseServiceCommand, stopExternalService } from "../tools/external-service.js";
-import { askConfirm } from "../ui/confirm.js";
 import { appVersion } from "../version.js";
 import { formatCompactCommandResult } from "../ui/command-output.js";
 import { logger } from "../ui/logger.js";
+import { type ConfirmationAction } from "../ui/selection.js";
+import { ChatTerminal, getActiveChatTerminal, isPlanExitShortcutKey, type ChatInputResult } from "../ui/chat-tui.js";
+import { deriveChatMode, type ChatMode, type RuntimeState } from "../ui/status-bar.js";
 import { diffCommand } from "./diff.js";
 import { doctorCommand } from "./doctor.js";
 import type { ValidationResult } from "../types.js";
@@ -65,21 +65,16 @@ type PlanModeState = {
   lastSummary?: string;
 };
 
-type ChatInputResult =
-  | { kind: "line"; value: string }
-  | { kind: "plan_exit_shortcut" };
-
-type KeypressLike = {
-  name?: string;
-  sequence?: string;
-  shift?: boolean;
+type ChatUi = {
+  status: ChatTerminal["status"];
+  setMode(mode: ChatMode): void;
+  setState(state: RuntimeState): void;
+  appendMarkdown(message: string): void;
+  readInput(planModeActive: boolean): Promise<ChatInputResult>;
+  confirmAction(message: string, choices?: import("../ui/selection.js").ConfirmationChoice[]): Promise<ConfirmationAction>;
+  stop(): void;
 };
-
-const planExitShortcutReason = "plan-exit-shortcut";
-
-export function isPlanExitShortcutKey(key: KeypressLike): boolean {
-  return (key.name === "tab" && key.shift === true) || key.sequence === "\u001b[Z";
-}
+export { isPlanExitShortcutKey };
 
 export function parseChatInput(value: string): ParsedChatInput {
   const trimmed = value.trim();
@@ -121,8 +116,9 @@ function printChatHelp(): void {
     "/exit, /quit       Leave chat",
     "",
     "For coding or command execution, describe what you want in natural language.",
-    "The model will infer the intent, then the CLI will ask before editing files or running commands.",
-    "Complex multi-step tasks are automatically decomposed into a plan and executed step by step.",
+    "The status bar shows model, root, mode, and runtime state throughout the chat.",
+    "The model infers intent, then selectable confirmations gate edits, commands, and validation.",
+    "Complex multi-step work is decomposed into a resumable task plan inside the same conversation.",
     "If validation commands fail after a code change, the agent will automatically propose repairs."
   ].join("\n"));
 }
@@ -321,6 +317,21 @@ type ExistingProjectState = {
 async function withProgress<T>(message: string, task: (update: ProgressUpdate) => Promise<T>): Promise<T> {
   const started = Date.now();
   let currentMessage = message;
+  const activeChat = getActiveChatTerminal();
+  if (activeChat) {
+    activeChat.append(`${message}...`);
+    const update: ProgressUpdate = (nextMessage) => {
+      currentMessage = nextMessage;
+    };
+    try {
+      const result = await task(update);
+      activeChat.append(`${currentMessage} (${formatElapsed(Date.now() - started)})`);
+      return result;
+    } catch (error) {
+      activeChat.append(`${currentMessage} failed (${formatElapsed(Date.now() - started)})`);
+      throw error;
+    }
+  }
   const spinner = ora(message).start();
   const timer = setInterval(() => {
     spinner.text = `${currentMessage} (${formatElapsed(Date.now() - started)})`;
@@ -341,36 +352,38 @@ async function withProgress<T>(message: string, task: (update: ProgressUpdate) =
   }
 }
 
-async function readChatInput(planModeActive: boolean): Promise<ChatInputResult> {
-  const message = planModeActive ? "you [PLAN - Shift+Tab exits]" : "you";
-  if (!planModeActive) {
-    return { kind: "line", value: await input({ message }) };
-  }
-
-  const controller = new AbortController();
-  let shortcutPressed = false;
-  const stdin = process.stdin;
-  const onKeypress = (_value: string, key: KeypressLike): void => {
-    if (!isPlanExitShortcutKey(key)) return;
-    shortcutPressed = true;
-    controller.abort(planExitShortcutReason);
-  };
-
-  readline.emitKeypressEvents(stdin);
-  stdin.on("keypress", onKeypress);
+async function withStatus<T>(ui: ChatUi | undefined, state: RuntimeState, task: () => Promise<T>): Promise<T> {
+  if (!ui) return task();
+  const previous = ui.status.getSnapshot().state;
+  ui.setState(state);
   try {
-    return {
-      kind: "line",
-      value: await input({ message }, { signal: controller.signal })
-    };
+    return await task();
   } catch (error) {
-    if (shortcutPressed || controller.signal.reason === planExitShortcutReason) {
-      return { kind: "plan_exit_shortcut" };
-    }
+    ui.setState("failed");
     throw error;
   } finally {
-    stdin.removeListener("keypress", onKeypress);
+    if (ui.status.getSnapshot().state === state) {
+      ui.setState(previous);
+    }
   }
+}
+
+async function confirmAction(ui: ChatUi | undefined, message: string, choices?: import("../ui/selection.js").ConfirmationChoice[]): Promise<ConfirmationAction> {
+  if (!ui) return "cancel";
+  return withStatus(ui, "confirming", () => ui.confirmAction(message, choices));
+}
+
+async function confirmProceed(ui: ChatUi | undefined, message: string): Promise<boolean> {
+  return (await confirmAction(ui, message)) === "proceed";
+}
+
+function renderAssistantReply(reply: string, ui?: ChatUi): void {
+  logger.heading("assistant");
+  if (ui) {
+    ui.appendMarkdown(reply);
+    return;
+  }
+  logger.info(reply);
 }
 
 export function analyzeEnvironmentFailures(results: ValidationResult[]): EnvironmentIssue | undefined {
@@ -579,7 +592,8 @@ async function handleResumeCommand(
   config: import("../types.js").RuntimeConfig,
   provider: import("../llm/provider.js").LlmProvider,
   history: ChatMessage[],
-  store: import("../state/run-store.js").RunStore
+  store: import("../state/run-store.js").RunStore,
+  ui?: ChatUi
 ): Promise<void> {
   if (!taskId) {
     // List tasks and let user pick
@@ -643,7 +657,8 @@ async function handleResumeCommand(
     state: { ...state, currentStepIndex: resumeIndex, status: "running" },
     store: taskStore,
     history,
-    runStore: store
+    runStore: store,
+    ui
   });
 }
 
@@ -680,15 +695,16 @@ async function handlePlanModeReply(
   config: import("../types.js").RuntimeConfig,
   provider: import("../llm/provider.js").LlmProvider,
   planMode: PlanModeState,
-  message: string
+  message: string,
+  ui?: ChatUi
 ): Promise<string> {
   planMode.messages.push({ role: "user", content: message });
   if (!planMode.goal) {
     planMode.goal = message;
   }
 
-  const context = await withProgress("Collecting project context", () => collectProjectContext(root, config, planMode.goal));
-  const reply = await withProgress("Discussing plan", () => generateChatReply({
+  const context = await withStatus(ui, "thinking", () => withProgress("Collecting project context", () => collectProjectContext(root, config, planMode.goal)));
+  const reply = await withStatus(ui, "thinking", () => withProgress("Discussing plan", () => generateChatReply({
     provider,
     model: config.model,
     message: [
@@ -699,11 +715,10 @@ async function handlePlanModeReply(
     ].join("\n"),
     history: planMode.messages,
     context
-  }));
+  })));
   planMode.messages.push({ role: "assistant", content: reply });
   planMode.lastSummary = summarizePlanMode(planMode.goal, planMode.messages);
-  logger.heading("assistant");
-  logger.info(reply);
+  renderAssistantReply(reply, ui);
   return reply;
 }
 
@@ -713,7 +728,8 @@ async function handleApplyPlanCommand(
   provider: import("../llm/provider.js").LlmProvider,
   planMode: PlanModeState,
   history: ChatMessage[],
-  runStore: import("../state/run-store.js").RunStore
+  runStore: import("../state/run-store.js").RunStore,
+  ui?: ChatUi
 ): Promise<void> {
   const summary = summarizePlanMode(planMode.goal, planMode.messages);
   planMode.lastSummary = summary;
@@ -761,7 +777,8 @@ async function handleApplyPlanCommand(
     state: taskState,
     store: taskStore,
     history,
-    runStore
+    runStore,
+    ui
   });
 }
 
@@ -774,9 +791,13 @@ async function runComplexTask(params: {
   store: import("../state/task-store.js").TaskStore;
   history: ChatMessage[];
   runStore: import("../state/run-store.js").RunStore;
+  ui?: ChatUi;
 }): Promise<void> {
-  const { root, config, provider, plan, state, store, history, runStore } = params;
+  const { root, config, provider, plan, state, store, history, runStore, ui } = params;
   const totalSteps = plan.steps.length;
+  const previousMode = ui?.status.getSnapshot().mode;
+  ui?.setMode("execute");
+  ui?.setState("idle");
 
   logger.heading("Task plan");
   for (const step of plan.steps) {
@@ -788,19 +809,30 @@ async function runComplexTask(params: {
   await store.writePlan(plan);
   await store.writeState({ ...state, status: "ready" });
 
-  const shouldStart = config.autoApply || await askConfirm("Execute this plan step by step?", true);
+  const shouldStart = config.autoApply || await confirmProceed(ui, "Execute this plan step by step?");
   if (!shouldStart) {
     logger.info("Plan saved. Use /resume to execute later.");
     history.push({ role: "assistant", content: `计划已保存：${plan.goal}。稍后可用 /resume 继续执行。` });
+    if (previousMode) ui?.setMode(previousMode);
     return;
   }
 
-  const generator = executeTask({ root, config, provider, plan, state, store, patchArtifactDir: runStore.dir });
+  const generator = executeTask({
+    root,
+    config,
+    provider,
+    plan,
+    state,
+    store,
+    patchArtifactDir: runStore.dir,
+    confirm: createExecutorConfirmationHandler(ui)
+  });
 
   try {
     for await (const event of generator) {
       switch (event.kind) {
         case "step_started": {
+          ui?.setState("thinking");
           logger.heading(`[${event.stepId}/${totalSteps}] ${event.stepTitle}`);
           break;
         }
@@ -813,10 +845,12 @@ async function runComplexTask(params: {
           break;
         }
         case "step_files_written": {
+          ui?.setState("idle");
           logger.success(`Files: ${event.files.join(", ")}`);
           break;
         }
         case "step_verification": {
+          ui?.setState("idle");
           if (event.results.length > 0) {
             for (const r of event.results) {
               const icon = r.exitCode === 0 ? "✓" : "✗";
@@ -826,6 +860,7 @@ async function runComplexTask(params: {
           break;
         }
         case "step_repair": {
+          ui?.setState("thinking");
           logger.warn(`Repair attempt ${event.attempt}/${event.maxAttempts}...`);
           break;
         }
@@ -849,29 +884,13 @@ async function runComplexTask(params: {
           break;
         }
         case "milestone": {
+          ui?.setState("confirming");
           logger.heading("Milestone reached");
           logger.info(event.progress);
-          const shouldContinue = config.autoApply || await askConfirm("Continue to next steps?", true);
-          if (!shouldContinue) {
-            logger.info("Task paused. Use /resume to continue.");
-            history.push({ role: "assistant", content: `任务已暂停在步骤 ${event.stepIndex + 1}/${totalSteps}。使用 /resume 继续。` });
-            return;
-          }
-          // Resume by creating a new generator with updated state
-          const updatedState = await store.readState();
-          if (!updatedState) return;
-          const nextGenerator = executeTask({
-            root, config, provider, plan,
-            state: { ...updatedState, currentStepIndex: resolveResumeStepIndex(plan, updatedState), status: "running" },
-            store,
-            patchArtifactDir: runStore.dir
-          });
-          // Continue processing events from the new generator
-          // We use a nested loop with a flag
-          await continueTaskExecution(nextGenerator, root, config, provider, plan, store, history, runStore.dir);
-          return;
+          break;
         }
         case "paused": {
+          ui?.setState("blocked");
           logger.warn(`Task paused: ${event.reason}`);
           if (event.state.lastFailure) {
             if (event.state.lastFailure.details.length > 0) {
@@ -888,11 +907,13 @@ async function runComplexTask(params: {
           return;
         }
         case "completed": {
+          ui?.setState("idle");
           logger.success(`Task completed: ${state.completedSteps.filter((s) => s.verificationResult === "passed").length}/${totalSteps} steps passed`);
           history.push({ role: "assistant", content: `任务完成：${plan.goal}。共完成 ${state.completedSteps.length} 个步骤。` });
           return;
         }
         case "failed": {
+          ui?.setState("failed");
           logger.error(`Task failed: ${event.error}`);
           history.push({ role: "assistant", content: `任务失败：${event.error}` });
           return;
@@ -900,8 +921,33 @@ async function runComplexTask(params: {
       }
     }
   } finally {
-    // Clean up generator if needed
+    if (previousMode) ui?.setMode(previousMode);
   }
+}
+
+function createExecutorConfirmationHandler(ui: ChatUi | undefined): (confirmation: ExecutorConfirmation) => Promise<ExecutorConfirmationResult> {
+  return async (confirmation) => {
+    if (confirmation.kind === "apply_patch") {
+      return confirmAction(ui, `Apply patch ${confirmation.patchName}?`, [
+        { value: "proceed", name: "Apply patch", description: `Write ${confirmation.files.length} file change(s).` },
+        { value: "defer", name: "Defer", description: "Save the task and apply later." },
+        { value: "cancel", name: "Cancel", description: "Stop this task without writing files." }
+      ]);
+    }
+    if (confirmation.kind === "run_command") {
+      return confirmAction(ui, `Run command "${confirmation.command}"?`, [
+        { value: "proceed", name: "Run command", description: confirmation.reason ?? "Execute this validation command." },
+        { value: "skip", name: "Skip", description: "Skip this command and pause the task." },
+        { value: "defer", name: "Defer", description: "Save the task and run later." },
+        { value: "cancel", name: "Cancel", description: "Stop this task." }
+      ]);
+    }
+    return confirmAction(ui, "Continue validation?", [
+      { value: "proceed", name: "Continue", description: "Move to the next task step." },
+      { value: "defer", name: "Defer", description: "Pause here and resume later." },
+      { value: "cancel", name: "Cancel", description: "Stop this task." }
+    ]);
+  };
 }
 
 async function continueTaskExecution(
@@ -912,12 +958,14 @@ async function continueTaskExecution(
   plan: TaskPlan,
   store: import("../state/task-store.js").TaskStore,
   history: ChatMessage[],
-  patchArtifactDir?: string
+  patchArtifactDir?: string,
+  ui?: ChatUi
 ): Promise<void> {
   const totalSteps = plan.steps.length;
   for await (const event of generator) {
     switch (event.kind) {
       case "step_started":
+        ui?.setState("thinking");
         logger.heading(`[${event.stepId}/${totalSteps}] ${event.stepTitle}`);
         break;
       case "step_code_plan":
@@ -927,15 +975,18 @@ async function continueTaskExecution(
         printPatchPreview(event.patchName, event.patch);
         break;
       case "step_files_written":
+        ui?.setState("idle");
         logger.success(`Files: ${event.files.join(", ")}`);
         break;
       case "step_verification":
+        ui?.setState("idle");
         for (const r of event.results) {
           const icon = r.exitCode === 0 ? "✓" : "✗";
           logger.info(`${icon} ${r.command} (${r.durationMs}ms)`);
         }
         break;
       case "step_repair":
+        ui?.setState("thinking");
         logger.warn(`Repair attempt ${event.attempt}/${event.maxAttempts}...`);
         break;
       case "step_environment_issue":
@@ -953,26 +1004,13 @@ async function continueTaskExecution(
         break;
       }
       case "milestone": {
+        ui?.setState("confirming");
         logger.heading("Milestone reached");
         logger.info(event.progress);
-        const shouldContinue = config.autoApply || await askConfirm("Continue to next steps?", true);
-        if (!shouldContinue) {
-          logger.info("Task paused. Use /resume to continue.");
-          history.push({ role: "assistant", content: `任务已暂停。使用 /resume 继续。` });
-          return;
-        }
-        const updatedState = await store.readState();
-        if (!updatedState) return;
-        const nextGen = executeTask({
-          root, config, provider, plan,
-          state: { ...updatedState, currentStepIndex: resolveResumeStepIndex(plan, updatedState), status: "running" },
-          store,
-          patchArtifactDir
-        });
-        await continueTaskExecution(nextGen, root, config, provider, plan, store, history, patchArtifactDir);
-        return;
+        break;
       }
       case "paused":
+        ui?.setState("blocked");
         logger.warn(`Task paused: ${event.reason}`);
         if (event.state.lastFailure) {
           if (event.state.lastFailure.details.length > 0) {
@@ -988,10 +1026,12 @@ async function continueTaskExecution(
         history.push({ role: "assistant", content: `任务暂停：${event.reason}` });
         return;
       case "completed":
+        ui?.setState("idle");
         logger.success("Task completed.");
         history.push({ role: "assistant", content: `任务完成：${plan.goal}` });
         return;
       case "failed":
+        ui?.setState("failed");
         logger.error(`Task failed: ${event.error}`);
         history.push({ role: "assistant", content: `任务失败：${event.error}` });
         return;
@@ -1007,8 +1047,9 @@ async function runRepairLoop(params: {
   runningCommands: RunningCommand[];
   task: string;
   patchArtifactDir?: string;
+  ui?: ChatUi;
 }): Promise<void> {
-  const { root, config, provider, history, runningCommands, task, patchArtifactDir } = params;
+  const { root, config, provider, history, runningCommands, task, patchArtifactDir, ui } = params;
   let failedResults: ValidationResult[] = [{ command: task, exitCode: 1, stdout: "", stderr: "", durationMs: 0 }];
 
   for (let attempt = 0; attempt < config.maxRepairAttempts && failedResults.length > 0; attempt++) {
@@ -1047,7 +1088,7 @@ async function runRepairLoop(params: {
     const repairPatch = await createFileActionsPatch(root, repairPlan.files);
     printPatchPreview(`repair-${attempt + 1}.diff`, repairPatch.patch);
 
-    if (!(config.autoApply || await askConfirm("Apply this repair?", true))) {
+    if (!(config.autoApply || await confirmProceed(ui, "Apply this repair?"))) {
       logger.info("Repair skipped.");
       history.push({ role: "assistant", content: "用户跳过修复。" });
       break;
@@ -1065,15 +1106,30 @@ async function runRepairLoop(params: {
     const newResults: ValidationResult[] = [];
     for (const cmd of repairPlan.commands) {
       if (requiresInstallConfirmation(cmd.command)) {
-        logger.info(`Skipped install command pending explicit user confirmation: ${cmd.command}`);
-        history.push({ role: "assistant", content: `安装命令需要明确确认，已跳过：${cmd.command}` });
+        if (config.autoApply) {
+          logger.info(`Skipped install command pending explicit user confirmation: ${cmd.command}`);
+          history.push({ role: "assistant", content: `安装命令需要明确确认，已跳过：${cmd.command}` });
+          continue;
+        }
+        const decision = await confirmAction(ui, `This looks like an install command. Run "${cmd.command}"?`, [
+          { value: "proceed", name: "Run command", description: "Run the install command now." },
+          { value: "skip", name: "Skip", description: "Skip this install command." },
+          { value: "defer", name: "Defer", description: "Handle this later." },
+          { value: "cancel", name: "Cancel", description: "Stop repair." }
+        ]);
+        if (decision === "proceed") {
+          await runChatCommand(root, cmd.command, runningCommands, history);
+        } else {
+          logger.info(`Skipped install command pending explicit user confirmation: ${cmd.command}`);
+          history.push({ role: "assistant", content: `安装命令需要明确确认，已跳过：${cmd.command}` });
+        }
       } else if (isLongRunningCommand(cmd.command)) {
-        if (await askConfirm(`Run "${cmd.command}"?`, false)) {
+        if (config.autoApply || await confirmProceed(ui, `Run "${cmd.command}"?`)) {
           await runChatCommand(root, cmd.command, runningCommands, history);
         }
       } else {
-        if (config.autoApply || await askConfirm(`Run "${cmd.command}"?`, false)) {
-          const result = await withProgress(`Running command: ${cmd.command}`, () => runValidationCommand(root, cmd.command));
+        if (config.autoApply || await confirmProceed(ui, `Run "${cmd.command}"?`)) {
+          const result = await withStatus(ui, "validating", () => withProgress(`Running command: ${cmd.command}`, () => runValidationCommand(root, cmd.command)));
           newResults.push(result);
           const output = formatCompactCommandResult(result);
           logger.heading("Command result");
@@ -1110,15 +1166,25 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
   await store.writeText("task.txt", "chat session");
   await store.writeJson("transcript.json", history);
 
-  logger.heading(`CodeShit Chat v${appVersion}`);
-  logger.info("Type naturally. The CLI asks before editing files or running commands. Type /help for controls.");
+  const ui = new ChatTerminal({
+    model: config.model,
+    projectRoot: root,
+    mode: deriveChatMode({ planModeActive: false }),
+    state: "idle"
+  });
+  ui.start();
 
-  while (true) {
+  try {
+    logger.heading(`CodeShit Chat v${appVersion}`);
+    logger.info("Type naturally. Confirmations use selectable actions before edits, commands, and validation steps. Type /help for controls.");
+
+    while (true) {
     let raw: string;
     try {
-      const chatInput = await readChatInput(planMode !== undefined);
+      const chatInput = await ui.readInput(planMode !== undefined);
       if (chatInput.kind === "plan_exit_shortcut") {
         planMode = await exitPlanMode(planMode, history, store);
+        ui.setMode(deriveChatMode({ planModeActive: false }));
         continue;
       }
       raw = chatInput.value;
@@ -1150,12 +1216,14 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
       history.length = 0;
       const wasInPlanMode = planMode !== undefined;
       planMode = undefined;
+      ui.setMode("chat");
       await store.writeJson("transcript.json", history);
       logger.info(wasInPlanMode ? "Conversation history cleared. Plan mode exited." : "Conversation history cleared.");
       continue;
     }
     if (parsed.kind === "plan_exit") {
       planMode = await exitPlanMode(planMode, history, store);
+      ui.setMode("chat");
       continue;
     }
     if (parsed.kind === "apply_plan") {
@@ -1167,8 +1235,9 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
         logger.warn("Plan mode has no goal or discussion yet. Describe what you want to plan first.");
         continue;
       }
-      await handleApplyPlanCommand(root, config, provider, planMode, history, store);
+      await handleApplyPlanCommand(root, config, provider, planMode, history, store, ui);
       planMode = undefined;
+      ui.setMode("chat");
       await store.writeJson("transcript.json", history);
       continue;
     }
@@ -1185,17 +1254,18 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
       continue;
     }
     if (parsed.kind === "resume") {
-      await handleResumeCommand(root, parsed.taskId, config, provider, history, store);
+      await handleResumeCommand(root, parsed.taskId, config, provider, history, store, ui);
       continue;
     }
     if (parsed.kind === "plan") {
       planMode = { goal: parsed.task, messages: [] };
+      ui.setMode("plan");
       history.push({ role: "user", content: parsed.task ? `/plan ${parsed.task}` : "/plan" });
       logger.heading("Plan mode");
       logger.info("Plan mode is active. I will discuss and refine the plan only.");
       logger.info("Use /apply-plan to turn this discussion into a task plan, or press Shift+Tab to return to normal chat.");
       if (parsed.task) {
-        await handlePlanModeReply(root, config, provider, planMode, parsed.task);
+        await handlePlanModeReply(root, config, provider, planMode, parsed.task, ui);
       } else {
         logger.info("Describe the goal you want to plan.");
       }
@@ -1210,41 +1280,40 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
 
     runningCommands = pruneStoppedCommands(runningCommands);
     if (planMode) {
-      await handlePlanModeReply(root, config, provider, planMode, parsed.message);
+      await handlePlanModeReply(root, config, provider, planMode, parsed.message, ui);
       await store.writeJson("transcript.json", history);
       continue;
     }
     history.push({ role: "user", content: parsed.message });
-    const context = await withProgress("Collecting project context", () => collectProjectContext(root, config, parsed.message));
+    const context = await withStatus(ui, "thinking", () => withProgress("Collecting project context", () => collectProjectContext(root, config, parsed.message)));
     if (isReadOnlyProjectQuestion(parsed.message)) {
-      const reply = await withProgress("Generating project review", () => generateChatReply({
+      const reply = await withStatus(ui, "thinking", () => withProgress("Generating project review", () => generateChatReply({
         provider,
         model: config.model,
         message: parsed.message,
         history,
         context
-      }));
+      })));
       history.push({ role: "assistant", content: reply });
       await store.writeJson("transcript.json", history);
-      logger.heading("assistant");
-      logger.info(reply);
+      renderAssistantReply(reply, ui);
       continue;
     }
 
-    const intent = await withProgress("Classifying request", () => classifyChatIntent({
+    const intent = await withStatus(ui, "thinking", () => withProgress("Classifying request", () => classifyChatIntent({
       provider,
       model: config.model,
       message: parsed.message,
       history,
       context,
       runtimeContext: formatRunningCommands(runningCommands)
-    }));
+    })));
 
     if (intent.intent === "task_goal") {
       logger.heading("Task goal");
       logger.info(`Goal: ${intent.task}`);
       logger.info(`Reason: ${intent.reason}`);
-      const shouldPlan = config.autoApply || await askConfirm("Create a resumable task plan for this goal?", true);
+      const shouldPlan = config.autoApply || await confirmProceed(ui, "Create a resumable task plan for this goal?");
       if (!shouldPlan) {
         logger.info("No task plan created.");
         history.push({ role: "assistant", content: "用户取消了任务计划，没有执行。" });
@@ -1252,15 +1321,15 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
         continue;
       }
 
-      const planContext = await withProgress("Collecting project context", () => collectProjectContext(root, config, intent.task));
+      const planContext = await withStatus(ui, "thinking", () => withProgress("Collecting project context", () => collectProjectContext(root, config, intent.task)));
       let plan: TaskPlan;
       try {
-        plan = await withProgress("Generating task plan", () => generateTaskPlan({
+        plan = await withStatus(ui, "thinking", () => withProgress("Generating task plan", () => generateTaskPlan({
           provider,
           model: config.model,
           goal: intent.task,
           context: planContext
-        }));
+        })));
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         logger.error(`Failed to generate task plan: ${message}`);
@@ -1288,7 +1357,8 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
         state: taskState,
         store: taskStore,
         history,
-        runStore: store
+        runStore: store,
+        ui
       });
       await store.writeJson("transcript.json", history);
       continue;
@@ -1298,9 +1368,9 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
       logger.heading("Suggested code change");
       logger.info(`Task: ${intent.task}`);
       logger.info(`Reason: ${intent.reason}`);
-      const shouldGenerate = await askConfirm("Generate file actions for this task?", true);
+      const shouldGenerate = config.autoApply || await confirmProceed(ui, "Generate file actions for this task?");
       if (!shouldGenerate) {
-        const shouldPlan = await askConfirm("Generate a plan only instead?", true);
+        const shouldPlan = await confirmProceed(ui, "Generate a plan only instead?");
         if (shouldPlan) {
           await executePlanOnly({ root, task: intent.task, config, provider });
           history.push({ role: "assistant", content: `已按确认生成计划：${intent.task}` });
@@ -1316,15 +1386,15 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
       const shouldUseTaskRuntime = !isCreateOrScaffoldTask(intent.task) && (isTaskGoalMessage(intent.task) || isComplexTask(intent.task));
       if (shouldUseTaskRuntime) {
         logger.info("Complex task detected — using multi-step execution.");
-        const planContext = await withProgress("Collecting project context", () => collectProjectContext(root, config, intent.task));
+        const planContext = await withStatus(ui, "thinking", () => withProgress("Collecting project context", () => collectProjectContext(root, config, intent.task)));
         let plan: TaskPlan | undefined;
         try {
-          plan = await withProgress("Generating task plan", () => generateTaskPlan({
+          plan = await withStatus(ui, "thinking", () => withProgress("Generating task plan", () => generateTaskPlan({
             provider,
             model: config.model,
             goal: intent.task,
             context: planContext
-          }));
+          })));
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           logger.error(`Failed to generate task plan: ${message}`);
@@ -1357,21 +1427,22 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
             state: taskState,
             store: taskStore,
             history,
-            runStore: store
+            runStore: store,
+            ui
           });
           await store.writeJson("transcript.json", history);
           continue;
         }
       }
 
-      const actionContext = await withProgress("Refreshing project context", () => collectProjectContext(root, config, intent.task));
+      const actionContext = await withStatus(ui, "thinking", () => withProgress("Refreshing project context", () => collectProjectContext(root, config, intent.task)));
       const existingProject = isCreateOrScaffoldTask(intent.task) ? inspectExistingProject(actionContext) : undefined;
       if (existingProject) {
         const message = formatExistingProjectState(existingProject);
         logger.heading("Existing project detected");
         logger.info(message);
         history.push({ role: "assistant", content: message });
-        const shouldAdaptExisting = config.autoApply || await askConfirm("Continue by adapting the existing project instead of creating from an empty directory?", true);
+        const shouldAdaptExisting = config.autoApply || await confirmProceed(ui, "Continue by adapting the existing project instead of creating from an empty directory?");
         if (!shouldAdaptExisting) {
           logger.info("No code changes made.");
           history.push({ role: "assistant", content: "用户取消了在已有项目上继续生成代码。" });
@@ -1381,13 +1452,13 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
       }
       let actionPlan;
       try {
-        actionPlan = await withProgress("Generating file actions", (update) => generateCodeActionPlan({
+        actionPlan = await withStatus(ui, "thinking", () => withProgress("Generating file actions", (update) => generateCodeActionPlan({
           provider,
           model: config.model,
           task: intent.task,
           context: actionContext,
           onProgress: update
-        }));
+        })));
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         logger.error(`Could not parse model file actions: ${message}`);
@@ -1407,11 +1478,11 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
       }
       const patchPreview = await createFileActionsPatch(root, actionPlan.files);
       printPatchPreview("patch.diff", patchPreview.patch);
-      if (actionPlan.files.length > 0 && (config.autoApply || await askConfirm("Write these files now?", false))) {
-        await applyFileActions(root, actionPlan.files, {
+      if (actionPlan.files.length > 0 && (config.autoApply || await confirmProceed(ui, "Apply this patch and write these files now?"))) {
+        await withStatus(ui, "applying", () => applyFileActions(root, actionPlan.files, {
           artifactDir: store.dir,
           patchName: "patch.diff"
-        });
+        }));
         logger.success("Files written.");
         history.push({ role: "assistant", content: `已写入文件：${actionPlan.files.map((file) => file.path).join(", ")}` });
       } else if (actionPlan.files.length > 0) {
@@ -1429,7 +1500,7 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
         if (stopFurtherCommands) break;
         const isInstall = requiresInstallConfirmation(cmd.command);
         const isLongRunning = isLongRunningCommand(cmd.command);
-        if (isInstall) {
+        if (isInstall && config.autoApply) {
           logger.info(`Skipped install command pending explicit user confirmation: ${cmd.command}`);
           history.push({ role: "assistant", content: `安装命令需要明确确认，已跳过：${cmd.command}` });
           await linkLocalTypeScriptToolchain(root);
@@ -1438,11 +1509,14 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
         const message = isInstall
           ? `This looks like an install command. Run "${cmd.command}"?`
           : `Run "${cmd.command}"?`;
-        if (await askConfirm(message, false)) {
+        const shouldRunCommand = isInstall
+          ? !config.autoApply && await confirmProceed(ui, message)
+          : config.autoApply || await confirmProceed(ui, message);
+        if (shouldRunCommand) {
           if (isLongRunning || isInstall) {
             await runChatCommand(root, cmd.command, runningCommands, history);
           } else {
-            const result = await withProgress(`Running command: ${cmd.command}`, () => runValidationCommand(root, cmd.command));
+            const result = await withStatus(ui, "validating", () => withProgress(`Running command: ${cmd.command}`, () => runValidationCommand(root, cmd.command)));
             const output = formatCompactCommandResult(result);
             logger.heading("Command result");
             logger.info(output);
@@ -1458,9 +1532,9 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
 
               if (shouldAttemptEnvironmentFix(environmentIssue)) {
                 // Try to fix missing local tooling/configuration automatically.
-                const fixContext = await withProgress("Attempting environment fix", () =>
+                const fixContext = await withStatus(ui, "thinking", () => withProgress("Attempting environment fix", () =>
                   collectProjectContext(root, config, result.command)
-                );
+                ));
                 const fix = await generateEnvironmentFix({
                   provider,
                   model: config.model,
@@ -1475,10 +1549,10 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
                     logger.info(`Files: ${fix.files.map((f) => f.path).join(", ")}`);
                     const fixPatch = await createFileActionsPatch(root, fix.files);
                     printPatchPreview("environment-fix.diff", fixPatch.patch);
-                    await applyFileActions(root, fix.files, {
+                    await withStatus(ui, "applying", () => applyFileActions(root, fix.files, {
                       artifactDir: store.dir,
                       patchName: "environment-fix.diff"
-                    });
+                    }));
                     for (const f of fix.files) {
                       // Make shell scripts executable
                       if (f.path.endsWith("gradlew") || f.path.endsWith("mvnw")) {
@@ -1495,9 +1569,9 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
 
                   // Retry the failed command
                   logger.info("Retrying failed command after environment fix...");
-                  const retryResult = await withProgress(`Retrying: ${result.command}`, () =>
+                  const retryResult = await withStatus(ui, "validating", () => withProgress(`Retrying: ${result.command}`, () =>
                     runValidationCommand(root, result.command)
-                  );
+                  ));
                   const retryOutput = formatCompactCommandResult(retryResult);
                   logger.heading("Retry result");
                   logger.info(retryOutput);
@@ -1525,6 +1599,9 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
         } else {
           logger.info(`Skipped command: ${cmd.command}`);
           history.push({ role: "assistant", content: `用户跳过命令：${cmd.command}` });
+          if (isInstall) {
+            await linkLocalTypeScriptToolchain(root);
+          }
           stopFurtherCommands = true;
         }
       }
@@ -1544,7 +1621,8 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
           history,
           runningCommands,
           task: `Original task: ${intent.task}\n\nCommand errors:\n${errorSummary}`,
-          patchArtifactDir: store.dir
+          patchArtifactDir: store.dir,
+          ui
         });
       }
 
@@ -1555,15 +1633,15 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
     if (intent.intent === "command") {
       if (isTaskGoalMessage(parsed.message)) {
         logger.info("Composite execution goal detected — using multi-step task runtime instead of a one-shot command.");
-        const planContext = await withProgress("Collecting project context", () => collectProjectContext(root, config, parsed.message));
+        const planContext = await withStatus(ui, "thinking", () => withProgress("Collecting project context", () => collectProjectContext(root, config, parsed.message)));
         let plan: TaskPlan;
         try {
-          plan = await withProgress("Generating task plan", () => generateTaskPlan({
+          plan = await withStatus(ui, "thinking", () => withProgress("Generating task plan", () => generateTaskPlan({
             provider,
             model: config.model,
             goal: parsed.message,
             context: planContext
-          }));
+          })));
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           logger.error(`Failed to generate task plan: ${message}`);
@@ -1590,7 +1668,8 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
           state: taskState,
           store: taskStore,
           history,
-          runStore: store
+          runStore: store,
+          ui
         });
         await store.writeJson("transcript.json", history);
         continue;
@@ -1600,20 +1679,17 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
       logger.info(`Reason: ${intent.reason}`);
       const isInstall = requiresInstallConfirmation(intent.command);
       const isLongRunning = isLongRunningCommand(intent.command);
-      if (isInstall) {
-        logger.info(`Install command requires explicit confirmation: ${intent.command}`);
-        history.push({ role: "assistant", content: `安装命令需要明确确认，未自动执行：${intent.command}` });
-        await store.writeJson("transcript.json", history);
-        continue;
-      }
       const message = isInstall
         ? "This looks like an install command. Run it?"
         : "Run this command?";
-      if (await askConfirm(message, false)) {
+      const shouldRunCommand = isInstall
+        ? !config.autoApply && await confirmProceed(ui, message)
+        : config.autoApply || await confirmProceed(ui, message);
+      if (shouldRunCommand) {
         if (isLongRunning || isInstall) {
           await runChatCommand(root, intent.command, runningCommands, history);
         } else {
-          const result = await withProgress(`Running command: ${intent.command}`, () => runValidationCommand(root, intent.command));
+          const result = await withStatus(ui, "validating", () => withProgress(`Running command: ${intent.command}`, () => runValidationCommand(root, intent.command)));
           const output = formatCompactCommandResult(result);
           logger.heading("Command result");
           logger.info(output);
@@ -1667,7 +1743,7 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
                 logger.info(`Saved blocked task. Use /resume ${taskStore.taskId} after resolving the environment issue.`);
               }
             } else {
-              const shouldRepair = await askConfirm("Command failed. Try to fix the code?", true);
+              const shouldRepair = await confirmProceed(ui, "Command failed. Try to fix the code?");
               if (shouldRepair) {
                 const repairTask = `Command "${intent.command}" failed. Fix the code.\n\nError:\n${result.stderr || result.stdout}`;
                 await runRepairLoop({
@@ -1677,7 +1753,8 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
                   history,
                   runningCommands,
                   task: repairTask,
-                  patchArtifactDir: store.dir
+                  patchArtifactDir: store.dir,
+                  ui
                 });
               }
             }
@@ -1693,17 +1770,19 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
 
     let reply = intent.answer;
     if (!reply.trim() || shouldRegenerateContextualReply(parsed.message, reply)) {
-      reply = await withProgress("Generating response", () => generateChatReply({
+      reply = await withStatus(ui, "thinking", () => withProgress("Generating response", () => generateChatReply({
         provider,
         model: config.model,
         message: parsed.message,
         history,
         context
-      }));
+      })));
     }
     history.push({ role: "assistant", content: reply });
     await store.writeJson("transcript.json", history);
-    logger.heading("assistant");
-    logger.info(reply);
+    renderAssistantReply(reply, ui);
+    }
+  } finally {
+    ui.stop();
   }
 }

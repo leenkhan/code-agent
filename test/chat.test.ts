@@ -1,5 +1,10 @@
+import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
 import { analyzeEnvironmentFailures, formatEnvironmentIssue, formatExistingProjectState, inspectExistingProject, isPlanExitShortcutKey, parseChatInput, shouldAttemptEnvironmentFix } from "../src/commands/chat.js";
+import { ChatTerminal, renderChatFrame } from "../src/ui/chat-tui.js";
+import { displayWidth, renderMarkdown, stripAnsiCodes } from "../src/ui/markdown.js";
+import { actionFromConfirmation } from "../src/ui/selection.js";
+import { deriveChatMode, formatStatusBar } from "../src/ui/status-bar.js";
 
 describe("parseChatInput", () => {
   it("parses control commands", () => {
@@ -41,6 +46,224 @@ describe("plan mode shortcuts", () => {
     expect(isPlanExitShortcutKey({ sequence: "\u001b[Z" })).toBe(true);
     expect(isPlanExitShortcutKey({ name: "tab" })).toBe(false);
     expect(isPlanExitShortcutKey({ name: "enter" })).toBe(false);
+  });
+});
+
+describe("chat status display", () => {
+  it("derives mode from chat state", () => {
+    expect(deriveChatMode({})).toBe("chat");
+    expect(deriveChatMode({ planModeActive: true })).toBe("plan");
+    expect(deriveChatMode({ planModeActive: true, executing: true })).toBe("execute");
+  });
+
+  it("formats a compact status bar", () => {
+    const line = formatStatusBar({
+      model: "deepseek-v4-pro",
+      projectRoot: "/tmp/example",
+      mode: "plan",
+      state: "thinking"
+    }, 80);
+
+    const visible = line.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "");
+    expect(visible).toBe("deepseek-v4-pro      /tmp/example     plan mode".padEnd(80));
+    expect(line).toContain("\u001b[33mdeepseek-v4-pro\u001b[0m");
+    expect(line).toContain("\u001b[32m/tmp/example\u001b[0m");
+    expect(line).toContain("\u001b[35mplan\u001b[0m mode");
+  });
+
+  it("renders a fixed three-line input area above the status bar", () => {
+    const lines = renderChatFrame({
+      history: ["assistant: ready"],
+      inputLabel: "you",
+      inputValue: "apply patch",
+      selection: {
+        message: "Apply patch?",
+        index: 0,
+        choices: [
+          { value: "proceed", name: "Apply patch" },
+          { value: "cancel", name: "Cancel" }
+        ]
+      },
+      status: {
+        model: "deepseek-v4-pro",
+        projectRoot: "/tmp/example",
+        mode: "execute",
+        state: "confirming"
+      },
+      columns: 80,
+      rows: 8
+    });
+
+    expect(lines).toHaveLength(8);
+    expect(lines.at(1)?.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")).toBe("you> apply patch".padEnd(80));
+    expect(lines.at(2)?.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")).toBe("".padEnd(80));
+    expect(lines.at(3)?.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")).toBe("".padEnd(80));
+    expect(lines.at(-4)).toContain("? Apply patch?");
+    expect(lines.at(-1)?.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")).toContain("execute mode");
+    expect(lines.at(-1)?.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")).not.toContain("confirming");
+  });
+
+  it("wraps long Chinese history lines to the terminal width", () => {
+    const lines = renderChatFrame({
+      history: ["assistant: 这是一个很长的中文段落，用来验证终端宽字符换行不会超过窗口宽度。"],
+      inputLabel: "you",
+      inputValue: "",
+      status: {
+        model: "模型",
+        projectRoot: "/tmp/example",
+        mode: "chat",
+        state: "idle"
+      },
+      columns: 24,
+      rows: 8
+    });
+
+    expect(lines).toHaveLength(8);
+    expect(lines.every((line) => displayWidth(line) === 24)).toBe(true);
+  });
+
+  it("keeps ANSI escape sequences intact when wrapping styled long lines", () => {
+    const styled = `assistant: \u001b[1m${"abcdef".repeat(8)}\u001b[0m`;
+    const lines = renderChatFrame({
+      history: [styled],
+      inputLabel: "you",
+      inputValue: "",
+      status: {
+        model: "deepseek-v4-pro",
+        projectRoot: "/tmp/example",
+        mode: "chat",
+        state: "idle"
+      },
+      columns: 20,
+      rows: 7
+    });
+
+    expect(lines.every((line) => displayWidth(line) === 20)).toBe(true);
+    expect(lines.join("\n")).not.toMatch(/\u001b\[[0-9;?]*[ -/]*$/m);
+  });
+
+  it("renders wide assistant markdown tables within the chat frame width", () => {
+    const markdown = renderMarkdown([
+      "| 项目 | 评分 | 状态 |",
+      "| --- | --- | --- |",
+      "| 登录 | ⭐⭐⭐ | 完成 |",
+      "| 部署 | ✅ | 进行中 |"
+    ].join("\n"));
+    const lines = renderChatFrame({
+      history: markdown.split("\n"),
+      inputLabel: "you",
+      inputValue: "",
+      status: {
+        model: "deepseek-v4-pro",
+        projectRoot: "/tmp/example",
+        mode: "chat",
+        state: "idle"
+      },
+      columns: 28,
+      rows: 12
+    });
+    const visible = stripAnsiCodes(lines.join("\n"));
+
+    expect(visible).toContain("│ 登录 │ ⭐⭐⭐");
+    expect(visible).toContain("│ 部署 │ ✅");
+    expect(visible).not.toContain("| --- |");
+    expect(lines.every((line) => displayWidth(line) === 28)).toBe(true);
+  });
+});
+
+describe("chat terminal lifecycle", () => {
+  it("renders assistant markdown separately from raw log output", () => {
+    const stdin = new PassThrough() as PassThrough & {
+      isTTY: true;
+      isRaw: boolean;
+      setRawMode(mode: boolean): void;
+    };
+    const stdout = new PassThrough() as PassThrough & {
+      isTTY: true;
+      columns: number;
+      rows: number;
+      cursorTo?(x: number, y?: number): boolean;
+      clearScreenDown?(): boolean;
+    };
+    stdin.isTTY = true;
+    stdin.isRaw = false;
+    stdin.setRawMode = (mode: boolean) => {
+      stdin.isRaw = mode;
+    };
+    stdout.isTTY = true;
+    stdout.columns = 100;
+    stdout.rows = 20;
+
+    const terminal = new ChatTerminal({
+      model: "deepseek-v4-pro",
+      projectRoot: "/tmp/example",
+      mode: "chat",
+      state: "idle"
+    }, {
+      stdin: stdin as unknown as NodeJS.ReadStream,
+      stdout: stdout as unknown as NodeJS.WriteStream
+    });
+
+    terminal.start();
+    terminal.appendMarkdown(["| A | B |", "| --- | --- |", "| one | two |"].join("\n"));
+    terminal.append(["| Raw | Log |", "| --- | --- |"].join("\n"));
+    terminal.stop();
+
+    const visible = stdout.read()?.toString("utf8").replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "") ?? "";
+    expect(visible).toContain("┌─────┬─────┐");
+    expect(visible).toContain("│ one │ two │");
+    expect(visible).toContain("| Raw | Log |");
+    expect(visible).toContain("| --- | --- |");
+  });
+
+  it("restores raw mode and pauses stdin on stop", () => {
+    const stdin = new PassThrough() as PassThrough & {
+      isTTY: true;
+      isRaw: boolean;
+      setRawMode(mode: boolean): void;
+    };
+    const stdout = new PassThrough() as PassThrough & {
+      isTTY: true;
+      columns: number;
+      rows: number;
+      cursorTo?(x: number, y?: number): boolean;
+      clearScreenDown?(): boolean;
+    };
+    stdin.isTTY = true;
+    stdin.isRaw = false;
+    stdin.setRawMode = (mode: boolean) => {
+      stdin.isRaw = mode;
+    };
+    stdout.isTTY = true;
+    stdout.columns = 80;
+    stdout.rows = 12;
+
+    const terminal = new ChatTerminal({
+      model: "deepseek-v4-pro",
+      projectRoot: "/tmp/example",
+      mode: "chat",
+      state: "idle"
+    }, {
+      stdin: stdin as unknown as NodeJS.ReadStream,
+      stdout: stdout as unknown as NodeJS.WriteStream
+    });
+
+    terminal.start();
+    expect(stdin.isRaw).toBe(true);
+    terminal.stop();
+    expect(stdin.isRaw).toBe(false);
+    expect(stdin.isPaused()).toBe(true);
+  });
+});
+
+describe("confirmation action parsing", () => {
+  it("maps simple yes/no fallback answers to explicit actions", () => {
+    expect(actionFromConfirmation(true)).toBe("proceed");
+    expect(actionFromConfirmation(false)).toBe("cancel");
+    expect(actionFromConfirmation(false, [
+      { value: "proceed", name: "Run" },
+      { value: "skip", name: "Skip" }
+    ])).toBe("skip");
   });
 });
 

@@ -245,4 +245,90 @@ describe("task executor state machine", () => {
 
     expect(resolveResumeStepIndex(plan, state)).toBe(1);
   });
+
+  it("asks for confirmation before applying generated file patches", async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-task-executor-"));
+    const store = await createTaskStore(root, "add readme");
+    const plan: TaskPlan = {
+      goal: "add readme",
+      steps: [{
+        id: "1",
+        title: "Write README",
+        description: "Create README",
+        expectedFiles: ["README.md"],
+        verification: "",
+        milestone: false
+      }]
+    };
+    const state = makeState(store.taskId);
+    await store.writePlan(plan);
+    await store.writeState(state);
+    vi.mocked(generateCodeActionPlan).mockResolvedValueOnce({
+      summary: "Create README",
+      files: [{ path: "README.md", content: "# Demo\n" }],
+      commands: []
+    });
+
+    const confirmations: string[] = [];
+    const events = [];
+    for await (const event of executeTask({
+      root,
+      config: { ...makeConfig(), autoApply: false },
+      provider,
+      plan,
+      state,
+      store,
+      confirm: async (confirmation) => {
+        confirmations.push(confirmation.kind);
+        return "defer";
+      }
+    })) {
+      events.push(event.kind);
+    }
+
+    expect(confirmations).toEqual(["apply_patch"]);
+    expect(events).toContain("step_patch");
+    expect(events).toContain("paused");
+    await expect(fs.pathExists(path.join(root, "README.md"))).resolves.toBe(false);
+  });
+
+  it("asks for confirmation before running validation commands", async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-task-executor-"));
+    const store = await createTaskStore(root, "verify");
+    const plan: TaskPlan = {
+      goal: "verify",
+      steps: [{
+        id: "1",
+        title: "Run tests",
+        description: "Run tests",
+        expectedFiles: [],
+        verification: "pnpm test",
+        milestone: false
+      }]
+    };
+    const state = makeState(store.taskId);
+    await store.writePlan(plan);
+    await store.writeState(state);
+
+    const confirmations: string[] = [];
+    const events = [];
+    for await (const event of executeTask({
+      root,
+      config: { ...makeConfig(), autoApply: false },
+      provider,
+      plan,
+      state,
+      store,
+      confirm: async (confirmation) => {
+        confirmations.push(confirmation.kind);
+        return "defer";
+      }
+    })) {
+      events.push(event.kind);
+    }
+
+    expect(confirmations).toEqual(["run_command"]);
+    expect(runValidationCommand).not.toHaveBeenCalled();
+    expect(events).toContain("paused");
+  });
 });
