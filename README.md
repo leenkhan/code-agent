@@ -189,7 +189,7 @@ Inside interactive chat:
 /diff              Print current git diff and latest run patch history
 /model [model]     Switch models within the current default provider
 /tasks             List saved tasks and their status
-/resume [task-id]  Resume a paused or incomplete task
+/resume [task-id]  Resume a paused or incomplete task, or pick one when omitted
 /plan [goal]       Enter multi-turn Plan Mode; does not edit files or run commands
 /apply-plan        Convert the current Plan Mode discussion into an executable task plan
 Shift+Tab          Leave Plan Mode and return to normal chat
@@ -198,6 +198,8 @@ Shift+Tab          Leave Plan Mode and return to normal chat
 ```
 
 `/model` is session-local. It can switch only between models listed for the current default provider; use `codeshit config` to change the default provider.
+
+In chat, `/resume <task-id>` resumes the specified task directly. Bare `/resume` opens a picker for paused, blocked, running, or failed tasks; if there is only one resumable task, CodeShit resumes it immediately.
 
 For long-running dev servers such as `npm run dev`, `pnpm dev`, `vite`, or `mvn spring-boot:run`, CodeShit can start a background process and return to the prompt. Internal service-control commands use the `codeshit` command namespace, for example `codeshit list-services 8000`.
 

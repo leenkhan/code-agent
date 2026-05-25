@@ -1,6 +1,11 @@
+import os from "node:os";
+import path from "node:path";
 import { PassThrough } from "node:stream";
+import fs from "fs-extra";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { analyzeEnvironmentFailures, createExecutorConfirmationHandler, formatEnvironmentIssue, formatExistingProjectState, inspectExistingProject, isPlanExitShortcutKey, parseChatInput, shouldAttemptEnvironmentFix } from "../src/commands/chat.js";
+import { analyzeEnvironmentFailures, buildResumeTaskChoices, createExecutorConfirmationHandler, formatEnvironmentIssue, formatExistingProjectState, getResumableTasks, inspectExistingProject, isPlanExitShortcutKey, parseChatInput, pickResumableTaskId, shouldAttemptEnvironmentFix } from "../src/commands/chat.js";
+import { chatCommandDefinitions, rankChatCommands } from "../src/commands/chat-commands.js";
+import { chatCommandUsagePath, readChatCommandUsage, recordChatCommandUsage } from "../src/state/chat-command-usage.js";
 import { ChatTerminal, renderChatFrame } from "../src/ui/chat-tui.js";
 import { displayWidth, renderMarkdown, stripAnsiCodes } from "../src/ui/markdown.js";
 import { actionFromConfirmation } from "../src/ui/selection.js";
@@ -8,6 +13,7 @@ import { ChatStatusBar, deriveChatMode, formatStatusBar, formatWorkStatusLine } 
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.unstubAllEnvs();
 });
 
 describe("parseChatInput", () => {
@@ -43,6 +49,119 @@ describe("parseChatInput", () => {
       kind: "unknown_command",
       command: "/xxx"
     });
+  });
+});
+
+describe("chat command autocomplete metadata", () => {
+  it("ranks commands by usage frequency and then alphabetically", () => {
+    const ranked = rankChatCommands(chatCommandDefinitions, {
+      "/plan": 3,
+      "/diff": 3,
+      "/help": 1
+    });
+
+    expect(ranked.slice(0, 3).map((command) => command.command)).toEqual([
+      "/diff",
+      "/plan",
+      "/help"
+    ]);
+    expect(ranked.map((command) => command.command)).toContain("/apply-plan");
+  });
+
+  it("stores global chat command usage and falls back when the file is corrupt", async () => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "codeshit-chat-usage-"));
+    vi.stubEnv("HOME", home);
+
+    await recordChatCommandUsage("/quit");
+    await recordChatCommandUsage("/plan");
+    await recordChatCommandUsage("/plan");
+
+    expect(chatCommandUsagePath()).toBe(path.join(home, ".codeshit", "chat-command-usage.json"));
+    await expect(readChatCommandUsage()).resolves.toMatchObject({
+      "/exit": 1,
+      "/plan": 2
+    });
+
+    await fs.writeFile(chatCommandUsagePath(), "{not-json", "utf8");
+    await expect(readChatCommandUsage()).resolves.toEqual({});
+    await fs.remove(home);
+  });
+});
+
+describe("resume task picker", () => {
+  it("filters to resumable tasks and formats full choice descriptions", () => {
+    const resumable = getResumableTasks([
+      { taskId: "task-4", goal: "Newest failed task", status: "failed", updatedAt: "2026-05-25T12:03:00.000Z" },
+      { taskId: "task-3", goal: "Already done", status: "completed", updatedAt: "2026-05-25T12:02:00.000Z" },
+      { taskId: "task-2", goal: "Blocked task", status: "blocked", updatedAt: "2026-05-25T12:01:00.000Z" },
+      { taskId: "task-1", goal: "Paused task", status: "paused", updatedAt: "2026-05-25T12:00:00.000Z" }
+    ]);
+
+    expect(resumable.map((task) => task.taskId)).toEqual(["task-4", "task-2", "task-1"]);
+
+    expect(buildResumeTaskChoices(resumable)).toEqual([
+      {
+        name: "task-4",
+        value: "task-4",
+        description: "Newest failed task | failed | 2026-05-25T12:03:00.000Z"
+      },
+      {
+        name: "task-2",
+        value: "task-2",
+        description: "Blocked task | blocked | 2026-05-25T12:01:00.000Z"
+      },
+      {
+        name: "task-1",
+        value: "task-1",
+        description: "Paused task | paused | 2026-05-25T12:00:00.000Z"
+      }
+    ]);
+  });
+
+  it("returns undefined when no resumable tasks exist", async () => {
+    const selectOption = vi.fn();
+
+    await expect(pickResumableTaskId([
+      { taskId: "task-1", goal: "Done", status: "completed", updatedAt: "2026-05-25T12:00:00.000Z" }
+    ], selectOption)).resolves.toBeUndefined();
+    expect(selectOption).not.toHaveBeenCalled();
+  });
+
+  it("auto-selects the only resumable task without opening a picker", async () => {
+    const selectOption = vi.fn();
+
+    await expect(pickResumableTaskId([
+      { taskId: "task-1", goal: "Done", status: "completed", updatedAt: "2026-05-25T12:00:00.000Z" },
+      { taskId: "task-2", goal: "Paused", status: "paused", updatedAt: "2026-05-25T12:01:00.000Z" }
+    ], selectOption)).resolves.toBe("task-2");
+    expect(selectOption).not.toHaveBeenCalled();
+  });
+
+  it("uses the picker for multiple resumable tasks and defaults to the newest one", async () => {
+    const selectOption = vi.fn().mockResolvedValue("task-2");
+
+    await expect(pickResumableTaskId([
+      { taskId: "task-3", goal: "Newest running", status: "running", updatedAt: "2026-05-25T12:02:00.000Z" },
+      { taskId: "task-2", goal: "Blocked task", status: "blocked", updatedAt: "2026-05-25T12:01:00.000Z" },
+      { taskId: "task-1", goal: "Done", status: "completed", updatedAt: "2026-05-25T12:00:00.000Z" }
+    ], selectOption)).resolves.toBe("task-2");
+
+    expect(selectOption).toHaveBeenCalledWith(
+      "Choose a task to resume:",
+      [
+        {
+          name: "task-3",
+          value: "task-3",
+          description: "Newest running | running | 2026-05-25T12:02:00.000Z"
+        },
+        {
+          name: "task-2",
+          value: "task-2",
+          description: "Blocked task | blocked | 2026-05-25T12:01:00.000Z"
+        }
+      ],
+      "task-3"
+    );
   });
 });
 
@@ -244,6 +363,36 @@ describe("chat status display", () => {
     }
   });
 
+  it("renders slash command suggestions below the input row", () => {
+    const lines = renderChatFrame({
+      history: [],
+      inputLabel: "you",
+      inputValue: "/p",
+      autocomplete: {
+        query: "/p",
+        index: 0,
+        suggestions: [{
+          command: "/plan",
+          usage: "/plan [goal]",
+          description: "Enter multi-turn plan mode; does not edit files or run commands",
+          completion: "/plan "
+        }]
+      },
+      status: {
+        model: "deepseek-v4-pro",
+        projectRoot: "/tmp/example",
+        mode: "chat",
+        state: "idle"
+      },
+      columns: 80,
+      rows: 8
+    }).map(stripAnsiCodes);
+
+    expect(lines).toHaveLength(8);
+    expect(lines.join("\n")).toContain("> /plan [goal] - Enter multi-turn plan mode");
+    expect(lines.at(-1)).toContain("chat mode");
+  });
+
   it("renders the work status line directly above the fixed input area", () => {
     const lines = renderChatFrame({
       history: ["assistant: ready"],
@@ -384,6 +533,51 @@ describe("chat status display", () => {
 });
 
 describe("chat terminal lifecycle", () => {
+  it("completes the selected slash command with tab", async () => {
+    const stdin = new PassThrough() as PassThrough & {
+      isTTY: true;
+      isRaw: boolean;
+      setRawMode(mode: boolean): void;
+    };
+    const stdout = new PassThrough() as PassThrough & {
+      isTTY: true;
+      columns: number;
+      rows: number;
+    };
+    stdin.isTTY = true;
+    stdin.isRaw = false;
+    stdin.setRawMode = (mode: boolean) => {
+      stdin.isRaw = mode;
+    };
+    stdout.isTTY = true;
+    stdout.columns = 80;
+    stdout.rows = 12;
+
+    const terminal = new ChatTerminal({
+      model: "deepseek-v4-pro",
+      projectRoot: "/tmp/example",
+      mode: "chat",
+      state: "idle"
+    }, {
+      stdin: stdin as unknown as NodeJS.ReadStream,
+      stdout: stdout as unknown as NodeJS.WriteStream,
+      autocompleteCommands: rankChatCommands(chatCommandDefinitions, {})
+    });
+
+    terminal.start();
+    const read = terminal.readInput(false);
+    stdin.emit("keypress", "/", { name: "slash" });
+    stdin.emit("keypress", "p", { name: "p" });
+    const visible = stripAnsiCodes(stdout.read()?.toString("utf8") ?? "");
+    expect(visible).toContain("/plan [goal]");
+
+    stdin.emit("keypress", "", { name: "tab" });
+    stdin.emit("keypress", "", { name: "enter" });
+
+    await expect(read).resolves.toEqual({ kind: "line", value: "/plan " });
+    terminal.stop();
+  });
+
   it("renders assistant markdown separately from raw log output", () => {
     const stdin = new PassThrough() as PassThrough & {
       isTTY: true;

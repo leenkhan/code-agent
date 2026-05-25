@@ -36,6 +36,8 @@ import { diffCommand } from "./diff.js";
 import { doctorCommand } from "./doctor.js";
 import type { ValidationResult } from "../types.js";
 import { buildProjectProfile, classifyEnvironmentFailures, shouldAttemptEnvironmentFix as shouldAttemptEnvironmentFixFromProfile } from "../project/profile.js";
+import { canonicalChatCommand, chatCommandDefinitions, findChatCommandDefinition, rankChatCommands } from "./chat-commands.js";
+import { readChatCommandUsage, recordChatCommandUsage } from "../state/chat-command-usage.js";
 
 export type ChatCliOptions = {
   model?: string;
@@ -83,32 +85,52 @@ type ChatUi = {
   stop(): void;
 };
 export { isPlanExitShortcutKey };
+export type SavedTaskSummary = Awaited<ReturnType<typeof listTasks>>[number];
+export type ResumeTaskSelector = (
+  message: string,
+  choices: ChatSelectChoice<string>[],
+  defaultValue?: string
+) => Promise<string>;
+export const resumableTaskStatuses = ["paused", "blocked", "running", "failed"] as const;
 
 export function parseChatInput(value: string): ParsedChatInput {
   const trimmed = value.trim();
   if (!trimmed) return { kind: "empty" };
-  if (trimmed === "/exit" || trimmed === "/quit") return { kind: "exit" };
-  if (trimmed === "/help") return { kind: "help" };
-  if (trimmed === "/clear") return { kind: "clear" };
-  if (trimmed === "/doctor") return { kind: "doctor" };
-  if (trimmed === "/diff") return { kind: "diff" };
-  if (trimmed === "/model" || trimmed.startsWith("/model ")) {
-    const model = trimmed.slice("/model".length).trim();
-    return { kind: "model", model: model || undefined };
-  }
-  if (trimmed === "/tasks") return { kind: "tasks" };
-  if (trimmed === "/apply-plan") return { kind: "apply_plan" };
-  if (trimmed === "/plan" || trimmed.startsWith("/plan ")) {
-    const task = trimmed.slice("/plan".length).trim();
-    if (task === "exit") return { kind: "plan_exit" };
-    return { kind: "plan", task: task || undefined };
-  }
-  if (trimmed.startsWith("/resume")) {
-    const taskId = trimmed.slice("/resume".length).trim();
-    return { kind: "resume", taskId: taskId || undefined };
+  const command = trimmed.split(/\s+/, 1)[0] ?? trimmed;
+  const definition = findChatCommandDefinition(command);
+  if (definition) {
+    switch (definition.command) {
+      case "/exit":
+        return { kind: "exit" };
+      case "/help":
+        return { kind: "help" };
+      case "/clear":
+        return { kind: "clear" };
+      case "/doctor":
+        return { kind: "doctor" };
+      case "/diff":
+        return { kind: "diff" };
+      case "/model": {
+        const model = trimmed.slice(command.length).trim();
+        return { kind: "model", model: model || undefined };
+      }
+      case "/tasks":
+        return { kind: "tasks" };
+      case "/apply-plan":
+        return { kind: "apply_plan" };
+      case "/plan": {
+        const task = trimmed.slice(command.length).trim();
+        if (task === "exit") return { kind: "plan_exit" };
+        return { kind: "plan", task: task || undefined };
+      }
+      case "/resume": {
+        const taskId = trimmed.slice(command.length).trim();
+        return { kind: "resume", taskId: taskId || undefined };
+      }
+    }
   }
   if (trimmed.startsWith("/")) {
-    return { kind: "unknown_command", command: trimmed.split(/\s+/, 1)[0] ?? trimmed };
+    return { kind: "unknown_command", command };
   }
   return { kind: "message", message: trimmed };
 }
@@ -116,17 +138,8 @@ export function parseChatInput(value: string): ParsedChatInput {
 function printChatHelp(): void {
   logger.heading("Chat commands");
   logger.info([
-    "/help              Show chat commands",
-    "/doctor            Print project diagnostics",
-    "/diff              Print current git diff and latest run patch path",
-    "/model [model]     Switch models within the current default provider",
-    "/tasks             List saved tasks and their status",
-    "/resume [task-id]  Resume a paused or incomplete task",
-    "/plan [goal]       Enter multi-turn plan mode; does not edit files or run commands",
-    "/apply-plan        Convert the current plan-mode discussion into an executable task plan",
+    ...chatCommandDefinitions.map((command) => `${command.usage.padEnd(19)} ${command.description}`),
     "Shift+Tab          Leave plan mode and return to normal chat",
-    "/clear             Clear in-memory conversation history",
-    "/exit, /quit       Leave chat",
     "",
     "For coding or command execution, describe what you want in natural language.",
     "The status bar shows model, root, mode, and runtime state throughout the chat.",
@@ -624,6 +637,33 @@ async function handleTasksCommand(root: string): Promise<void> {
   logger.info("Use /resume <task-id> to continue a paused or incomplete task.");
 }
 
+export function getResumableTasks(tasks: SavedTaskSummary[]): SavedTaskSummary[] {
+  return tasks.filter((task) => resumableTaskStatuses.includes(task.status as (typeof resumableTaskStatuses)[number]));
+}
+
+export function buildResumeTaskChoices(tasks: SavedTaskSummary[]): ChatSelectChoice<string>[] {
+  return tasks.map((task) => ({
+    name: task.taskId,
+    value: task.taskId,
+    description: `${task.goal} | ${task.status} | ${task.updatedAt}`
+  }));
+}
+
+export async function pickResumableTaskId(
+  tasks: SavedTaskSummary[],
+  selectOption?: ResumeTaskSelector
+): Promise<string | undefined> {
+  const resumableTasks = getResumableTasks(tasks);
+  if (resumableTasks.length === 0) return undefined;
+  if (resumableTasks.length === 1) return resumableTasks[0]?.taskId;
+  if (!selectOption) return resumableTasks[0]?.taskId;
+  return selectOption(
+    "Choose a task to resume:",
+    buildResumeTaskChoices(resumableTasks),
+    resumableTasks[0]?.taskId
+  );
+}
+
 async function handleResumeCommand(
   root: string,
   taskId: string | undefined,
@@ -634,24 +674,10 @@ async function handleResumeCommand(
   ui?: ChatUi
 ): Promise<void> {
   if (!taskId) {
-    // List tasks and let user pick
     const tasks = await listTasks(root);
-    const incomplete = tasks.filter((t) => t.status === "paused" || t.status === "blocked" || t.status === "running" || t.status === "failed");
-    if (incomplete.length === 0) {
+    taskId = await pickResumableTaskId(tasks, ui?.selectOption.bind(ui));
+    if (!taskId) {
       logger.info("No paused or incomplete tasks to resume.");
-      if (tasks.length > 0) {
-        logger.info("Use /tasks to see all tasks, then /resume <task-id> to resume a specific one.");
-      }
-      return;
-    }
-    if (incomplete.length === 1) {
-      taskId = incomplete[0].taskId;
-    } else {
-      logger.heading("Incomplete tasks");
-      for (const t of incomplete) {
-        logger.info(`  ${t.taskId} — ${t.goal} (${t.status})`);
-      }
-      logger.info("Use /resume <task-id> to resume a specific task.");
       return;
     }
   }
@@ -1329,6 +1355,7 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
   const history: ChatMessage[] = [];
   let runningCommands: RunningCommand[] = [];
   let planMode: PlanModeState | undefined;
+  const chatCommandUsage = await readChatCommandUsage();
   const store = await createRunStore(root, "chat session");
   await store.writeText("task.txt", "chat session");
   await store.writeJson("transcript.json", history);
@@ -1338,6 +1365,8 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
     projectRoot: root,
     mode: deriveChatMode({ planModeActive: false }),
     state: "idle"
+  }, {
+    autocompleteCommands: rankChatCommands(chatCommandDefinitions, chatCommandUsage)
   });
   ui.start();
 
@@ -1367,6 +1396,10 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
 
     const parsed = parseChatInput(raw);
     if (parsed.kind === "empty") continue;
+    const submittedCommand = raw.trim().split(/\s+/, 1)[0] ?? "";
+    if (canonicalChatCommand(submittedCommand)) {
+      await recordChatCommandUsage(submittedCommand);
+    }
     if (parsed.kind === "exit") {
       const stopped = await stopBackgroundCommands(runningCommands);
       if (stopped > 0) {

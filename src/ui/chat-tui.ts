@@ -35,6 +35,7 @@ export type KeypressLike = {
 export type ChatTerminalStreams = {
   stdin?: NodeJS.ReadStream;
   stdout?: NodeJS.WriteStream;
+  autocompleteCommands?: ChatAutocompleteCommand[];
 };
 
 type SelectionState = {
@@ -43,10 +44,28 @@ type SelectionState = {
   index: number;
 };
 
+export type ChatAutocompleteCommand = {
+  command: string;
+  usage: string;
+  description: string;
+};
+
+export type ChatAutocompleteSuggestion = ChatAutocompleteCommand & {
+  completion: string;
+};
+
+type AutocompleteState = {
+  query: string;
+  suggestions: ChatAutocompleteSuggestion[];
+  index: number;
+};
+
 type ReadState = {
   planModeActive: boolean;
   buffer: string;
   cursor: number;
+  autocompleteIndex: number;
+  autocompleteHidden: boolean;
 };
 
 const INPUT_BG = "\u001b[48;5;238m";
@@ -67,6 +86,7 @@ export function renderChatFrame(input: {
   inputLabel: string;
   inputValue: string;
   selection?: SelectionState;
+  autocomplete?: AutocompleteState;
   status: StatusSnapshot;
   workStatus?: WorkStatusSnapshot;
   columns: number;
@@ -74,8 +94,9 @@ export function renderChatFrame(input: {
 }): string[] {
   const columns = Math.max(input.columns, 20);
   const rows = Math.max(input.rows, 8);
+  const autocompleteLines = input.autocomplete ? Math.min(input.autocomplete.suggestions.length, 6) : 0;
   const selectionLines = input.selection ? 1 + input.selection.choices.length : 0;
-  const fixedLines = 4 + selectionLines + 1;
+  const fixedLines = 4 + autocompleteLines + selectionLines + 1;
   const historyHeight = Math.max(rows - fixedLines, 0);
   const wrappedHistory = input.history.flatMap((line) => wrapDisplayLine(line, columns));
   const historyLines = historyHeight > 0 ? wrappedHistory.slice(-historyHeight) : [];
@@ -88,6 +109,14 @@ export function renderChatFrame(input: {
   lines.push(formatInputRow(`${input.inputLabel}> ${input.inputValue}`, columns));
   lines.push(formatInputRow("", columns));
   lines.push(formatInputRow("", columns));
+  if (input.autocomplete) {
+    const visibleSuggestions = input.autocomplete.suggestions.slice(0, 6);
+    for (let i = 0; i < visibleSuggestions.length; i += 1) {
+      const suggestion = visibleSuggestions[i]!;
+      const marker = i === input.autocomplete.index ? ">" : " ";
+      lines.push(fitDisplayLine(`${marker} ${suggestion.usage} - ${suggestion.description}`, columns));
+    }
+  }
   if (input.selection) {
     lines.push(fitDisplayLine(`? ${input.selection.message}`, columns));
     for (let i = 0; i < input.selection.choices.length; i += 1) {
@@ -106,6 +135,7 @@ export class ChatTerminal {
   private readonly stdin: NodeJS.ReadStream;
   private readonly stdout: NodeJS.WriteStream;
   private readonly interactive: boolean;
+  private readonly autocompleteCommands: ChatAutocompleteCommand[];
   private history: string[] = [];
   private readState: ReadState | undefined;
   private selection: SelectionState | undefined;
@@ -121,6 +151,7 @@ export class ChatTerminal {
   constructor(snapshot: StatusSnapshot, streams: ChatTerminalStreams = {}) {
     this.stdin = streams.stdin ?? process.stdin;
     this.stdout = streams.stdout ?? process.stdout;
+    this.autocompleteCommands = streams.autocompleteCommands ?? [];
     this.interactive = Boolean(this.stdin.isTTY && this.stdout.isTTY);
     this.status = new ChatStatusBar(snapshot, () => this.render());
   }
@@ -251,7 +282,7 @@ export class ChatTerminal {
     }
 
     return new Promise<ChatInputResult>((resolve, reject) => {
-      this.readState = { planModeActive, buffer: "", cursor: 0 };
+      this.readState = { planModeActive, buffer: "", cursor: 0, autocompleteIndex: 0, autocompleteHidden: false };
       const onKeypress = (value: string, key: KeypressLike): void => {
         try {
           const result = this.handleInputKey(value, key);
@@ -325,21 +356,50 @@ export class ChatTerminal {
     if (key.ctrl && key.name === "c") throw new Error("interrupted");
     if (key.name === "return" || key.name === "enter") return { kind: "line", value: state.buffer };
     if (key.name === "escape") {
-      state.buffer = "";
-      state.cursor = 0;
+      if (this.currentAutocomplete()) {
+        state.autocompleteHidden = true;
+      } else {
+        state.buffer = "";
+        state.cursor = 0;
+        state.autocompleteIndex = 0;
+        state.autocompleteHidden = false;
+      }
       this.render();
       return undefined;
+    }
+    if (key.name === "tab") {
+      const autocomplete = this.currentAutocomplete();
+      const selected = autocomplete?.suggestions[autocomplete.index];
+      if (selected) {
+        state.buffer = selected.completion;
+        state.cursor = state.buffer.length;
+        state.autocompleteIndex = 0;
+        state.autocompleteHidden = true;
+        this.render();
+      }
+      return undefined;
+    }
+    if (key.name === "up" || key.name === "down") {
+      const autocomplete = this.currentAutocomplete();
+      if (autocomplete) {
+        const delta = key.name === "up" ? -1 : 1;
+        state.autocompleteIndex = (autocomplete.index + delta + autocomplete.suggestions.length) % autocomplete.suggestions.length;
+        this.render();
+        return undefined;
+      }
     }
     if (key.name === "backspace") {
       if (state.cursor > 0) {
         state.buffer = `${state.buffer.slice(0, state.cursor - 1)}${state.buffer.slice(state.cursor)}`;
         state.cursor -= 1;
+        state.autocompleteHidden = false;
       }
       this.render();
       return undefined;
     }
     if (key.name === "delete") {
       state.buffer = `${state.buffer.slice(0, state.cursor)}${state.buffer.slice(state.cursor + 1)}`;
+      state.autocompleteHidden = false;
       this.render();
       return undefined;
     }
@@ -348,6 +408,8 @@ export class ChatTerminal {
     else if (!key.ctrl && !key.meta && value && value >= " ") {
       state.buffer = `${state.buffer.slice(0, state.cursor)}${value}${state.buffer.slice(state.cursor)}`;
       state.cursor += value.length;
+      state.autocompleteIndex = 0;
+      state.autocompleteHidden = false;
     }
     this.render();
     return undefined;
@@ -378,11 +440,13 @@ export class ChatTerminal {
   private render(): void {
     if (!this.interactive) return;
     const readState = this.readState;
+    const autocomplete = this.currentAutocomplete();
     const lines = renderChatFrame({
       history: this.history,
       inputLabel: readState?.planModeActive ? "you [PLAN]" : "you",
       inputValue: readState?.buffer ?? "",
       selection: this.selection,
+      autocomplete,
       status: this.status.getSnapshot(),
       workStatus: this.workStatus,
       columns: this.stdout.columns ?? 100,
@@ -392,8 +456,9 @@ export class ChatTerminal {
     readline.clearScreenDown(this.stdout as WriteStream);
     this.stdout.write(lines.join("\n"));
     if (readState && !this.selection) {
+      const autocompleteLines = autocomplete ? Math.min(autocomplete.suggestions.length, 6) : 0;
       const selectionLines = 0;
-      const fixedLines = 4 + selectionLines + 1;
+      const fixedLines = 4 + autocompleteLines + selectionLines + 1;
       const historyRows = Math.max((this.stdout.rows ?? 24) - fixedLines, 0);
       const inputRow = historyRows + 1;
       const prefix = `you${readState.planModeActive ? " [PLAN]" : ""}> `;
@@ -432,8 +497,39 @@ export class ChatTerminal {
     clearTimeout(this.resizeTimer);
     this.resizeTimer = undefined;
   }
+
+  private currentAutocomplete(): AutocompleteState | undefined {
+    const state = this.readState;
+    if (!state || state.autocompleteHidden || this.selection) return undefined;
+    const query = slashCommandQuery(state.buffer);
+    if (!query) return undefined;
+    const exactCommand = this.autocompleteCommands.some((command) => command.command === query);
+    if (exactCommand) return undefined;
+    const suggestions = this.autocompleteCommands
+      .filter((command) => command.command.startsWith(query))
+      .map((command) => ({
+        ...command,
+        completion: completeSlashCommandInput(state.buffer, query, command.command)
+      }));
+    if (suggestions.length === 0) return undefined;
+    const index = Math.min(state.autocompleteIndex, suggestions.length - 1);
+    state.autocompleteIndex = index;
+    return { query, suggestions, index };
+  }
 }
 
 function formatInputRow(text: string, columns: number): string {
   return `${INPUT_BG}${fitDisplayLine(text, columns)}${ANSI_RESET}`;
+}
+
+function slashCommandQuery(buffer: string): string | undefined {
+  if (!buffer.startsWith("/")) return undefined;
+  const firstWhitespace = buffer.search(/\s/);
+  const tokenEnd = firstWhitespace === -1 ? buffer.length : firstWhitespace;
+  return buffer.slice(0, tokenEnd);
+}
+
+function completeSlashCommandInput(buffer: string, query: string, command: string): string {
+  const suffix = buffer.slice(query.length);
+  return `${command}${suffix.startsWith(" ") ? suffix : ` ${suffix}`}`;
 }
