@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.2 - 2026-05-25
 
 - Global LLM config now supports multiple saved providers in `~/.codeshit/config.json` under `providers`.
 - `codeshit config` updates an existing provider entry when selected again, or appends a new entry when the provider is not yet configured.

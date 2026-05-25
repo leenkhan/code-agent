@@ -319,7 +319,7 @@ Validate the packed CLI in a temp project before publishing:
 
 ```bash
 npm pack --dry-run
-npm install -g ./codeshit-cli-0.3.1.tgz
+npm install -g ./codeshit-cli-0.3.2.tgz
 codeshit --help
 codeshit doctor
 ```
