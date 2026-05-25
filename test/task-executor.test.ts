@@ -114,6 +114,45 @@ describe("task executor state machine", () => {
     expect(saved?.lastFailure?.exitCode).toBe(127);
   });
 
+  it("does not generate an environment patch for a missing python command", async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-task-executor-"));
+    const store = await createTaskStore(root, "验证 Python API");
+    const command = "cd backserve && python -c \"print('ok')\"";
+    const plan: TaskPlan = {
+      goal: "验证 Python API",
+      steps: [{
+        id: "1",
+        title: "Verify API",
+        description: "Run a FastAPI smoke test",
+        expectedFiles: [],
+        verification: command,
+        milestone: false
+      }]
+    };
+    const state = makeState(store.taskId);
+    await store.writePlan(plan);
+    await store.writeState(state);
+    vi.mocked(runValidationCommand).mockResolvedValueOnce({
+      command,
+      exitCode: 127,
+      stdout: "",
+      stderr: "/bin/sh: python: command not found",
+      durationMs: 12
+    });
+
+    const events = [];
+    for await (const event of executeTask({ root, config: makeConfig(), provider, plan, state, store })) {
+      events.push(event.kind);
+    }
+
+    const saved = await store.readState();
+    expect(events).toContain("step_environment_issue");
+    expect(events).toContain("paused");
+    expect(generateEnvironmentFix).not.toHaveBeenCalled();
+    expect(saved?.status).toBe("blocked");
+    expect(saved?.lastFailure?.command).toBe(command);
+  });
+
   it("does not generate files for operational verification steps even when planner lists expected files", async () => {
     root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-task-executor-"));
     const store = await createTaskStore(root, "启动服务并完成测试");

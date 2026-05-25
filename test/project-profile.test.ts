@@ -3,7 +3,8 @@ import {
   buildProjectProfile,
   classifyEnvironmentFailures,
   detectValidationCommandsFromProfile,
-  isLongRunningCommandForProfile
+  isLongRunningCommandForProfile,
+  shouldAttemptEnvironmentFix
 } from "../src/project/profile.js";
 import type { ProjectLanguage } from "../src/types.js";
 
@@ -138,6 +139,28 @@ describe("project profile detection", () => {
     expect(classifyEnvironmentFailures([{ command: "curl http://localhost:8080", exitCode: 7, stdout: "", stderr: "curl: (7) Failed to connect" }], profile)?.kind).toBe("service_not_started");
     expect(classifyEnvironmentFailures([{ command: "go test ./...", exitCode: 1, stdout: "", stderr: "syntax error: unexpected name" }], buildProjectProfile(["go.mod"]))?.kind).toBe("compile_failed");
     expect(classifyEnvironmentFailures([{ command: "dotnet test", exitCode: 1, stdout: "Tests failed: 1", stderr: "" }], buildProjectProfile(["App.csproj"]))?.kind).toBe("test_failed");
+  });
+
+  it("only attempts automatic environment fixes for project wrapper files", () => {
+    const profile = buildProjectProfile(["pyproject.toml"]);
+    const missingPython = classifyEnvironmentFailures([{
+      command: "python -m pytest",
+      exitCode: 127,
+      stdout: "",
+      stderr: "/bin/sh: python: command not found"
+    }], profile);
+    const missingWrapper = classifyEnvironmentFailures([{
+      command: "./mvnw test",
+      exitCode: 127,
+      stdout: "",
+      stderr: "No such file or directory"
+    }], buildProjectProfile(["pom.xml"]));
+
+    expect(missingPython?.kind).toBe("missing_command");
+    expect(missingPython?.suggestions.join("\n")).toContain("python3");
+    expect(shouldAttemptEnvironmentFix(missingPython!)).toBe(false);
+    expect(missingWrapper?.kind).toBe("missing_wrapper");
+    expect(shouldAttemptEnvironmentFix(missingWrapper!)).toBe(true);
   });
 
   it("detects long-running start commands from the active profile", () => {

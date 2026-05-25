@@ -1,7 +1,7 @@
 import path from "node:path";
-import fg from "fast-glob";
 import fs from "fs-extra";
 import type { ImportantFile, ProjectContext, ProjectLanguage, ProjectProfile, ToolchainAdapter, ValidationStepType } from "../types.js";
+import { safeProjectGlob } from "./glob.js";
 
 export type EnvironmentIssueKind =
   | "missing_command"
@@ -414,6 +414,9 @@ export function classifyEnvironmentFailures(results: Array<{ command: string; ex
       if (profile?.environmentChecks.length) {
         suggestions.add(`Install the required toolchain: ${profile.environmentChecks.join(", ")}.`);
       }
+      if (tool === "python") {
+        suggestions.add("If this system only provides `python3`, rerun with `python3` or create/activate a project virtual environment.");
+      }
       suggestions.add(`Install or add "${tool}" to PATH, then rerun the command.`);
       continue;
     }
@@ -464,7 +467,7 @@ export function classifyEnvironmentFailures(results: Array<{ command: string; ex
 }
 
 export function shouldAttemptEnvironmentFix(issue: EnvironmentIssue): boolean {
-  return !["service_not_started", "dependency_download_failure", "network_unavailable", "compile_failed", "test_failed"].includes(issue.kind);
+  return issue.kind === "missing_wrapper";
 }
 
 export function matchesProfileFile(filePath: string, profile: ProjectProfile): boolean {
@@ -474,7 +477,7 @@ export function matchesProfileFile(filePath: string, profile: ProjectProfile): b
 }
 
 export async function detectValidationCommandsFromProfileOnDisk(root: string, profile: ProjectProfile): Promise<string[]> {
-  const fileTree = await fg(["**/*"], { cwd: root, dot: true, onlyFiles: true, followSymbolicLinks: false });
+  const fileTree = await safeProjectGlob(["**/*"], root);
   const packageJsonPath = path.join(root, "package.json");
   let packageJson: { scripts?: Record<string, string> } | undefined;
   if (await fs.pathExists(packageJsonPath)) {

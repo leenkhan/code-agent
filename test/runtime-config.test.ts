@@ -128,6 +128,64 @@ describe("resolveRuntimeConfig", () => {
     expect(config.model).toBe("claude-sonnet-4-6");
   });
 
+  it("uses the provider marked as default from multi-provider global config", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-root-"));
+    await fs.mkdir(path.join(home, ".codeshit"), { recursive: true });
+    await fs.writeFile(
+      path.join(home, ".codeshit", "config.json"),
+      JSON.stringify({
+        providers: [
+          {
+            provider: "deepseek",
+            apiKey: "deepseek-key",
+            model: "deepseek-v4-pro",
+            baseUrl: "https://api.deepseek.com/anthropic",
+            isDefault: false
+          },
+          {
+            provider: "qwen-cn",
+            apiKey: "dashscope-key",
+            model: "qwen3.6-flash",
+            baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            isDefault: true
+          }
+        ]
+      }),
+      "utf8"
+    );
+
+    const config = await resolveRuntimeConfig(root);
+
+    expect(config.provider).toBe("qwen-cn");
+    expect(config.model).toBe("qwen3.6-flash");
+    expect(config.apiKey).toBe("dashscope-key");
+  });
+
+  it("model overrides do not switch the default provider", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-root-"));
+    await fs.mkdir(path.join(home, ".codeshit"), { recursive: true });
+    await fs.writeFile(
+      path.join(home, ".codeshit", "config.json"),
+      JSON.stringify({
+        providers: [
+          {
+            provider: "qwen-cn",
+            apiKey: "dashscope-key",
+            model: "qwen3.6-plus",
+            baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            isDefault: true
+          }
+        ]
+      }),
+      "utf8"
+    );
+
+    const config = await resolveRuntimeConfig(root, { model: "deepseek-v4-pro" });
+
+    expect(config.provider).toBe("qwen-cn");
+    expect(config.model).toBe("deepseek-v4-pro");
+  });
+
   it("keeps global credentials when the project root is the home directory", async () => {
     await fs.mkdir(path.join(home, ".codeshit"), { recursive: true });
     await fs.writeFile(

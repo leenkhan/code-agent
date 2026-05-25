@@ -12,11 +12,16 @@ export type ProviderName =
   | "claude"
   | "gemini";
 
-export type GlobalConfig = {
+export type GlobalProviderConfig = {
   provider: ProviderName;
   apiKey?: string;
   model: string;
   baseUrl?: string;
+  isDefault: boolean;
+};
+
+export type GlobalConfig = {
+  providers: GlobalProviderConfig[];
 };
 
 export type ProjectConfig = {

@@ -8,6 +8,8 @@ describe("safety policies", () => {
     expect(canReadFile(".env")).toBe(false);
     expect(canReadFile(".ssh/id_rsa")).toBe(false);
     expect(canWriteFile("dist/cli.js")).toBe(false);
+    expect(canWriteFile("venv/bin/python")).toBe(false);
+    expect(canWriteFile(".venv/bin/python")).toBe(false);
     expect(canWriteFile("src/cli.ts")).toBe(true);
   });
 

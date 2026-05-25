@@ -37,6 +37,7 @@ describe("config and init commands", () => {
     vi.mocked(select)
       .mockResolvedValueOnce("qwen-cn")
       .mockResolvedValueOnce("qwen3.6-flash");
+    vi.mocked(confirm).mockResolvedValueOnce(true);
     vi.mocked(password).mockResolvedValueOnce("dashscope-key");
     vi.mocked(input).mockResolvedValueOnce("https://dashscope.aliyuncs.com/compatible-mode/v1");
 
@@ -44,12 +45,77 @@ describe("config and init commands", () => {
 
     const globalConfig = JSON.parse(await fs.readFile(path.join(home, ".codeshit", "config.json"), "utf8")) as Record<string, unknown>;
     expect(globalConfig).toEqual({
-      provider: "qwen-cn",
-      apiKey: "dashscope-key",
-      model: "qwen3.6-flash",
-      baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+      providers: [
+        {
+          provider: "deepseek",
+          model: "deepseek-v4-pro",
+          baseUrl: "https://api.deepseek.com/anthropic",
+          isDefault: false
+        },
+        {
+          provider: "qwen-cn",
+          apiKey: "dashscope-key",
+          model: "qwen3.6-flash",
+          baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+          isDefault: true
+        }
+      ]
     });
     await expect(fs.stat(path.join(root, ".codeshit", "config.json"))).rejects.toThrow();
+  });
+
+  it("config updates an existing provider without removing other providers", async () => {
+    await fs.mkdir(path.join(home, ".codeshit"), { recursive: true });
+    await fs.writeFile(
+      path.join(home, ".codeshit", "config.json"),
+      JSON.stringify({
+        providers: [
+          {
+            provider: "deepseek",
+            apiKey: "deepseek-key",
+            model: "deepseek-v4-pro",
+            baseUrl: "https://api.deepseek.com/anthropic",
+            isDefault: true
+          },
+          {
+            provider: "qwen-cn",
+            apiKey: "old-qwen-key",
+            model: "qwen3.6-plus",
+            baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            isDefault: false
+          }
+        ]
+      }),
+      "utf8"
+    );
+    vi.mocked(select)
+      .mockResolvedValueOnce("qwen-cn")
+      .mockResolvedValueOnce("qwen3.6-flash");
+    vi.mocked(confirm).mockResolvedValueOnce(false);
+    vi.mocked(password).mockResolvedValueOnce("");
+    vi.mocked(input).mockResolvedValueOnce("https://dashscope.aliyuncs.com/compatible-mode/v1");
+
+    await configCommand();
+
+    const globalConfig = JSON.parse(await fs.readFile(path.join(home, ".codeshit", "config.json"), "utf8")) as Record<string, unknown>;
+    expect(globalConfig).toEqual({
+      providers: [
+        {
+          provider: "deepseek",
+          apiKey: "deepseek-key",
+          model: "deepseek-v4-pro",
+          baseUrl: "https://api.deepseek.com/anthropic",
+          isDefault: true
+        },
+        {
+          provider: "qwen-cn",
+          apiKey: "old-qwen-key",
+          model: "qwen3.6-flash",
+          baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+          isDefault: false
+        }
+      ]
+    });
   });
 
   it("init writes only project config and runs directory", async () => {

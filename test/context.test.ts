@@ -98,6 +98,27 @@ describe("collectProjectContext", () => {
     );
   });
 
+  it("skips protected home-directory trees without dropping normal project files", async () => {
+    const root = await makeRoot();
+    await fs.mkdir(path.join(root, "src"), { recursive: true });
+    await fs.mkdir(path.join(root, ".Trash"), { recursive: true });
+    await fs.writeFile(path.join(root, "src", "index.ts"), "export function keep() { return true; }\n");
+    await fs.writeFile(path.join(root, ".Trash", "secret.ts"), "export function leak() { return false; }\n");
+
+    const context = await collectProjectContext(root, config);
+
+    expect(context.fileTree).toContain("src/index.ts");
+    expect(context.fileTree).not.toContain(".Trash/secret.ts");
+    expect(context.importantFiles.map((file) => file.path)).toContain("src/index.ts");
+    expect(context.importantFiles.map((file) => file.path)).not.toContain(".Trash/secret.ts");
+    expect(context.symbols).toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: "src/index.ts", name: "keep" })])
+    );
+    expect(context.symbols).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: ".Trash/secret.ts", name: "leak" })])
+    );
+  });
+
   it("renders structured context without changing callers", async () => {
     const root = await makeRoot();
     await fs.writeFile(path.join(root, "index.ts"), "export function entry() { return 1; }\n");

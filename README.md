@@ -4,7 +4,7 @@ CodeShit is a local-first CLI coding agent for messy codebases.
 
 It reads your project, plans changes, shows patch diffs before writing, applies patches locally, runs validation commands, and can continue multi-step tasks with saved state.
 
-> Public beta: CodeShit is a 0.x tool. It is patch-based, confirmation-oriented, and local-first, but command behavior and UX may still change quickly.
+> CodeShit is a 0.x tool. It is patch-based, confirmation-oriented, and local-first, but command behavior and UX may still change quickly.
 
 ## Install
 
@@ -30,7 +30,7 @@ Requirements:
 
 - Node.js 20+
 - Git
-- DeepSeek API key or OpenAI API key
+- API key for at least one supported LLM provider
 
 ## Quick Start
 
@@ -72,7 +72,7 @@ codeshit resume
 ## What It Does
 
 - `codeshit` / `codeshit chat`: starts an interactive terminal coding session.
-- `codeshit config`: creates or updates global LLM provider config.
+- `codeshit config`: creates or updates global LLM provider config, including multiple saved providers.
 - `codeshit init`: creates or updates project config in the current directory.
 - `codeshit doctor`: prints project, config, Git, and environment diagnostics.
 - `codeshit plan "<task>"`: generates an implementation plan without editing files.
@@ -94,6 +94,8 @@ Patch: patch.diff
 ```
 
 Patch artifacts are saved under `.codeshit/runs/<run>/` for review and rollback.
+
+See [CHANGELOG.md](CHANGELOG.md) for notable changes.
 
 ## Configuration
 
@@ -119,12 +121,26 @@ Example global config:
 
 ```json
 {
-  "provider": "deepseek",
-  "apiKey": "sk-...",
-  "model": "deepseek-v4-pro",
-  "baseUrl": "https://api.deepseek.com/anthropic"
+  "providers": [
+    {
+      "provider": "deepseek",
+      "apiKey": "sk-...",
+      "model": "deepseek-v4-pro",
+      "baseUrl": "https://api.deepseek.com/anthropic",
+      "isDefault": true
+    },
+    {
+      "provider": "qwen-cn",
+      "apiKey": "sk-...",
+      "model": "qwen3.6-flash",
+      "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "isDefault": false
+    }
+  ]
 }
 ```
+
+`codeshit config` stores LLM providers under `providers`. Reconfiguring an existing provider replaces that provider entry; choosing a new provider appends it. The `isDefault` flag marks the single provider/model used by `codeshit`, `chat`, `plan`, `fix`, and `resume` unless a project or CLI model override is provided.
 
 Example project config:
 
@@ -150,6 +166,8 @@ export DASHSCOPE_API_KEY="..."
 
 Environment variables take precedence over config file `apiKey` values. CodeShit does not print API keys.
 
+Project config and CLI `--model` values only override the model name for the current default provider. They do not switch providers.
+
 ### Migration From Pre-Beta Builds
 
 Older local builds used `.code-agent` and `~/.code-agent`.
@@ -169,6 +187,7 @@ Inside interactive chat:
 /help              Show chat commands
 /doctor            Print project diagnostics
 /diff              Print current git diff and latest run patch history
+/model [model]     Switch models within the current default provider
 /tasks             List saved tasks and their status
 /resume [task-id]  Resume a paused or incomplete task
 /plan [goal]       Enter multi-turn Plan Mode; does not edit files or run commands
@@ -177,6 +196,8 @@ Shift+Tab          Leave Plan Mode and return to normal chat
 /clear             Clear in-memory conversation history
 /exit, /quit       Leave chat
 ```
+
+`/model` is session-local. It can switch only between models listed for the current default provider; use `codeshit config` to change the default provider.
 
 For long-running dev servers such as `npm run dev`, `pnpm dev`, `vite`, or `mvn spring-boot:run`, CodeShit can start a background process and return to the prompt. Internal service-control commands use the `codeshit` command namespace, for example `codeshit list-services 8000`.
 
@@ -298,15 +319,15 @@ Validate the packed CLI in a temp project before publishing:
 
 ```bash
 npm pack --dry-run
-npm install -g ./codeshit-cli-0.3.1-beta.2.tgz
+npm install -g ./codeshit-cli-0.3.1.tgz
 codeshit --help
 codeshit doctor
 ```
 
-Publish beta manually:
+Publish manually:
 
 ```bash
-npm publish --access public --tag beta
+npm publish --access public
 ```
 
 ## License

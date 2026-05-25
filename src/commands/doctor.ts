@@ -1,7 +1,7 @@
 import path from "node:path";
 import fs from "fs-extra";
 import { logger } from "../ui/logger.js";
-import { globalConfigPath, readGlobalConfig } from "../state/global-config.js";
+import { getDefaultGlobalProviderConfig, globalConfigPath, readGlobalConfig } from "../state/global-config.js";
 import { projectConfigPath, readProjectConfig } from "../state/project-config.js";
 import { resolveRuntimeConfig } from "../state/config.js";
 import { getProviderDefinition, getEnvApiKey } from "../llm/catalog.js";
@@ -21,8 +21,9 @@ export async function doctorCommand(root: string): Promise<void> {
   const gitAvailable = await isGitAvailable();
   const gitRepo = await isGitRepo(root);
   const importantFiles = await detectImportantFiles(root);
-  const provider = getProviderDefinition(globalConfig.provider);
-  const envKey = getEnvApiKey(globalConfig.provider);
+  const defaultProviderConfig = getDefaultGlobalProviderConfig(globalConfig);
+  const provider = getProviderDefinition(defaultProviderConfig.provider);
+  const envKey = getEnvApiKey(defaultProviderConfig.provider);
 
   logger.heading("CodeShit Doctor");
   logger.info(`Current working directory: ${process.cwd()}`);
@@ -33,10 +34,15 @@ export async function doctorCommand(root: string): Promise<void> {
   logger.info(`Node.js version: ${process.version}`);
   logger.info(`Global config exists: ${globalExists ? "yes" : "no"} (${globalPath})`);
   logger.info(`Project config exists: ${projectExists ? "yes" : "no"} (${projectPath})`);
-  logger.info(`LLM provider: ${runtimeConfig.provider}`);
-  logger.info(`Model: ${runtimeConfig.model}`);
+  logger.info(`Default LLM provider: ${runtimeConfig.provider}`);
+  logger.info(`Default model: ${runtimeConfig.model}`);
   logger.info(`API base URL: ${runtimeConfig.baseUrl ?? "(provider default)"}`);
-  logger.info(`${provider.envKey} configured: ${envKey || globalConfig.apiKey ? "yes" : "no"}`);
+  logger.info(`${provider.envKey} configured: ${envKey || defaultProviderConfig.apiKey ? "yes" : "no"}`);
+  logger.heading("Configured LLM providers");
+  logger.info(formatList(globalConfig.providers.map((entry) => {
+    const marker = entry.isDefault ? "default" : "configured";
+    return `${entry.provider}: ${entry.model} (${marker})`;
+  })));
   logger.heading("Detected important files");
   logger.info(formatList(importantFiles));
   logger.heading("Configured validation commands");

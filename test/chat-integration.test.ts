@@ -207,6 +207,41 @@ function makePersistentPlanProvider() {
   return { provider, calls };
 }
 
+function makeApplyPlanExecutionProvider() {
+  const calls: string[] = [];
+  const provider: LlmProvider = {
+    async generateText(input) {
+      calls.push(input.prompt);
+      if (input.responseFormat === "json_object" && input.prompt.includes("\"steps\"")) {
+        return JSON.stringify({
+          goal: "Add a reviewed banner",
+          steps: [{
+            id: "1",
+            title: "Add banner module",
+            description: "Create the banner module agreed in plan mode.",
+            expectedFiles: ["src/banner.ts"],
+            verification: "",
+            milestone: false,
+            dependsOn: []
+          }]
+        });
+      }
+      if (input.responseFormat === "json_object" && input.prompt.includes("\"summary\"")) {
+        return JSON.stringify({
+          summary: "Add banner module",
+          files: [{ path: "src/banner.ts", content: "export const banner = 'hello from plan mode';\n" }],
+          commands: []
+        });
+      }
+      if (input.prompt.includes("Summarize the result")) {
+        return "Banner module created.";
+      }
+      return "Plan discussion reply";
+    }
+  };
+  return { provider, calls };
+}
+
 function makeKotlinProviderThatMisclassifiesCreation(): LlmProvider {
   return {
     async generateText(input) {
@@ -254,6 +289,17 @@ function makeRepairProvider(brokenResponse: string, fixedResponse: string, retur
   };
 }
 
+function makeModelRecordingProvider() {
+  const models: Array<string | undefined> = [];
+  const provider: LlmProvider = {
+    async generateText(input) {
+      models.push(input.model);
+      return JSON.stringify({ intent: "answer", answer: "done" });
+    }
+  };
+  return { provider, models };
+}
+
 function resetMockState() {
   mockState.inputIndex = 0;
   mockState.userMessages = [];
@@ -263,6 +309,39 @@ function resetMockState() {
     "/exit"
   ];
 }
+
+describe("chat integration: model switching", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.clearAllMocks();
+    resetMockState();
+  });
+
+  it("switches only to models from the default provider during a chat session", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "codeshit-chat-model-"));
+    vi.stubEnv("DEEPSEEK_API_KEY", "test-key");
+    mockState.inputs = ["/model deepseek-v4-flash", "hello", "/exit"];
+    const { provider, models } = makeModelRecordingProvider();
+    vi.mocked(createLlmProvider).mockReturnValue(provider);
+
+    await chatCommand(root, { autoApply: true });
+
+    expect(models).toContain("deepseek-v4-flash");
+  });
+
+  it("rejects models from another provider", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "codeshit-chat-model-"));
+    vi.stubEnv("DEEPSEEK_API_KEY", "test-key");
+    mockState.inputs = ["/model qwen3.6-flash", "hello", "/exit"];
+    const { provider, models } = makeModelRecordingProvider();
+    vi.mocked(createLlmProvider).mockReturnValue(provider);
+
+    await chatCommand(root, { autoApply: true });
+
+    expect(models).toContain("deepseek-v4-pro");
+    expect(models).not.toContain("qwen3.6-flash");
+  });
+});
 
 describe("chat integration: full code generation flow", () => {
   afterEach(() => {
@@ -354,27 +433,44 @@ describe("chat integration: plan command", () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-chat-plan-next-"));
     vi.stubEnv("DEEPSEEK_API_KEY", "test-key");
     mockState.inputs = ["/plan", "add a checkout flow", "/exit"];
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
     const { provider, calls } = makePlanOnlyProvider();
     vi.mocked(createLlmProvider).mockReturnValue(provider);
 
-    await chatCommand(root, { autoApply: true, model: "deepseek-v4-pro" });
+    try {
+      await chatCommand(root, { autoApply: true, model: "deepseek-v4-pro" });
 
-    expect(calls.some((prompt) => prompt.includes("add a checkout flow"))).toBe(true);
-    expect(calls.some((prompt) => prompt.includes("Return JSON matching one of:"))).toBe(false);
-    expect(mockState.promptMessages).toContain("you");
-    expect(mockState.promptMessages).toContain("you [PLAN - Shift+Tab exits]");
+      expect(calls.some((prompt) => prompt.includes("add a checkout flow"))).toBe(true);
+      expect(calls.some((prompt) => prompt.includes("Return JSON matching one of:"))).toBe(false);
+      expect(mockState.promptMessages).toContain("you");
+      expect(mockState.promptMessages).toContain("you [PLAN - Shift+Tab exits]");
+      expect(logSpy.mock.calls.flat().join("\n")).not.toContain("Exited plan mode.");
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 
   it("exits bare plan mode with /plan exit without calling the model", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-chat-plan-exit-"));
     vi.stubEnv("DEEPSEEK_API_KEY", "test-key");
     mockState.inputs = ["/plan", "/plan exit", "/exit"];
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
     const { provider, calls } = makePlanOnlyProvider();
     vi.mocked(createLlmProvider).mockReturnValue(provider);
 
-    await chatCommand(root, { autoApply: true, model: "deepseek-v4-pro" });
+    try {
+      await chatCommand(root, { autoApply: true, model: "deepseek-v4-pro" });
 
-    expect(calls).toEqual([]);
+      expect(calls).toEqual([]);
+      expect(logSpy.mock.calls.flat().join("\n")).toContain("Exited plan mode.");
+      expect(mockState.promptMessages).toEqual([
+        "you",
+        "you [PLAN - Shift+Tab exits]",
+        "you"
+      ]);
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 
   it("ignores /apply-plan outside plan mode without calling the model", async () => {
@@ -407,6 +503,24 @@ describe("chat integration: plan command", () => {
     expect(taskIds).toHaveLength(1);
     await expect(fs.readFile(path.join(taskRoot, taskIds[0]!, "plan.json"), "utf8")).resolves.toContain("Add a reviewed login flow");
     await expect(fs.readFile(path.join(root, "src/login.ts"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("applies plan mode and records a completed task state with auto-apply", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-chat-apply-plan-complete-"));
+    vi.stubEnv("DEEPSEEK_API_KEY", "test-key");
+    mockState.inputs = ["/plan add banner", "use the reviewed copy", "/apply-plan", "/exit"];
+    const { provider, calls } = makeApplyPlanExecutionProvider();
+    vi.mocked(createLlmProvider).mockReturnValue(provider);
+
+    await chatCommand(root, { autoApply: true, model: "deepseek-v4-pro" });
+
+    await expect(fs.readFile(path.join(root, "src/banner.ts"), "utf8")).resolves.toBe("export const banner = 'hello from plan mode';\n");
+    expect(calls.some((prompt) => prompt.includes("use the reviewed copy"))).toBe(true);
+    const taskRoot = path.join(root, ".codeshit", "tasks");
+    const taskIds = await fs.readdir(taskRoot);
+    const state = JSON.parse(await fs.readFile(path.join(taskRoot, taskIds[0]!, "state.json"), "utf8")) as { status: string; completedSteps: unknown[] };
+    expect(state.status).toBe("completed");
+    expect(state.completedSteps).toHaveLength(1);
   });
 });
 

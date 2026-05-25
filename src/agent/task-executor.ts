@@ -28,7 +28,7 @@ export type ExecutorEvent =
 
 export type ExecutorConfirmation =
   | { kind: "apply_patch"; stepIndex: number; stepId: string; patchName: string; patch: string; files: string[] }
-  | { kind: "run_command"; stepIndex: number; stepId: string; command: string; reason?: string }
+  | { kind: "run_command"; stepIndex: number; stepId: string; command: string; reason?: string; requiresExplicitConfirmation?: boolean }
   | { kind: "continue_validation"; stepIndex: number; stepId: string; progress: string };
 
 export type ExecutorConfirmationResult = "proceed" | "skip" | "defer" | "cancel";
@@ -166,7 +166,8 @@ export async function* executeTask(params: {
           stepIndex: i,
           stepId: step.id,
           command: cmd.command,
-          reason
+          reason,
+          requiresExplicitConfirmation: true
         });
         if (decision === "proceed") {
           const result = await runValidationCommand(root, cmd.command);

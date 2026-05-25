@@ -7,12 +7,13 @@ import { applyFileActions, createFileActionsPatch, formatCodeActionPlan, generat
 import { executePlanOnly } from "../agent/runtime.js";
 import { generateTaskPlan, normalizeTaskPlanForContext } from "../agent/task-planner.js";
 import { executeTask, resolveResumeStepIndex, type ExecutorConfirmation, type ExecutorConfirmationResult, type ExecutorEvent } from "../agent/task-executor.js";
+import { getProviderDefinition } from "../llm/catalog.js";
 import { createLlmProvider } from "../llm/factory.js";
 import { collectProjectContext } from "../project/context.js";
 import { resolveRuntimeConfig } from "../state/config.js";
 import { createRunStore } from "../state/run-store.js";
 import { createTaskStore, listTasks, loadTaskStore } from "../state/task-store.js";
-import type { TaskPlan, TaskState } from "../types.js";
+import type { RuntimeConfig, TaskPlan, TaskState } from "../types.js";
 import { requiresInstallConfirmation } from "../safety/command-policy.js";
 import {
   isLongRunningCommand,
@@ -29,8 +30,8 @@ import { appVersion } from "../version.js";
 import { formatCompactCommandResult } from "../ui/command-output.js";
 import { logger } from "../ui/logger.js";
 import { type ConfirmationAction } from "../ui/selection.js";
-import { ChatTerminal, getActiveChatTerminal, isPlanExitShortcutKey, type ChatInputResult } from "../ui/chat-tui.js";
-import { deriveChatMode, type ChatMode, type RuntimeState } from "../ui/status-bar.js";
+import { ChatTerminal, getActiveChatTerminal, isPlanExitShortcutKey, type ChatInputResult, type ChatSelectChoice } from "../ui/chat-tui.js";
+import { deriveChatMode, type ChatMode, type RuntimeState, type WorkStatusSnapshot, type WorkStatusState } from "../ui/status-bar.js";
 import { diffCommand } from "./diff.js";
 import { doctorCommand } from "./doctor.js";
 import type { ValidationResult } from "../types.js";
@@ -51,6 +52,7 @@ export type ParsedChatInput =
   | { kind: "clear" }
   | { kind: "doctor" }
   | { kind: "diff" }
+  | { kind: "model"; model?: string }
   | { kind: "tasks" }
   | { kind: "resume"; taskId?: string }
   | { kind: "plan"; task?: string }
@@ -69,9 +71,15 @@ type ChatUi = {
   status: ChatTerminal["status"];
   setMode(mode: ChatMode): void;
   setState(state: RuntimeState): void;
+  setModel(model: string): void;
+  startWork(work: Omit<WorkStatusSnapshot, "state" | "startedAt" | "stepStartedAt" | "finishedAt"> & Partial<Pick<WorkStatusSnapshot, "startedAt" | "stepStartedAt">>): void;
+  updateWork(work: Partial<WorkStatusSnapshot>): void;
+  finishWork(state: Exclude<WorkStatusState, "running" | "idle">, work?: Omit<Partial<WorkStatusSnapshot>, "state" | "finishedAt">): void;
+  clearWork(): void;
   appendMarkdown(message: string): void;
   readInput(planModeActive: boolean): Promise<ChatInputResult>;
   confirmAction(message: string, choices?: import("../ui/selection.js").ConfirmationChoice[]): Promise<ConfirmationAction>;
+  selectOption<T extends string>(message: string, choices: ChatSelectChoice<T>[], defaultValue?: T): Promise<T>;
   stop(): void;
 };
 export { isPlanExitShortcutKey };
@@ -84,6 +92,10 @@ export function parseChatInput(value: string): ParsedChatInput {
   if (trimmed === "/clear") return { kind: "clear" };
   if (trimmed === "/doctor") return { kind: "doctor" };
   if (trimmed === "/diff") return { kind: "diff" };
+  if (trimmed === "/model" || trimmed.startsWith("/model ")) {
+    const model = trimmed.slice("/model".length).trim();
+    return { kind: "model", model: model || undefined };
+  }
   if (trimmed === "/tasks") return { kind: "tasks" };
   if (trimmed === "/apply-plan") return { kind: "apply_plan" };
   if (trimmed === "/plan" || trimmed.startsWith("/plan ")) {
@@ -107,6 +119,7 @@ function printChatHelp(): void {
     "/help              Show chat commands",
     "/doctor            Print project diagnostics",
     "/diff              Print current git diff and latest run patch path",
+    "/model [model]     Switch models within the current default provider",
     "/tasks             List saved tasks and their status",
     "/resume [task-id]  Resume a paused or incomplete task",
     "/plan [goal]       Enter multi-turn plan mode; does not edit files or run commands",
@@ -121,6 +134,29 @@ function printChatHelp(): void {
     "Complex multi-step work is decomposed into a resumable task plan inside the same conversation.",
     "If validation commands fail after a code change, the agent will automatically propose repairs."
   ].join("\n"));
+}
+
+async function handleModelCommand(config: RuntimeConfig, requestedModel: string | undefined, ui: ChatUi): Promise<void> {
+  const provider = getProviderDefinition(config.provider);
+  let nextModel = requestedModel;
+  if (!nextModel) {
+    nextModel = await ui.selectOption(
+      "Switch model:",
+      provider.models.map((model) => ({ name: model, value: model })),
+      provider.models.includes(config.model) ? config.model : provider.defaultModel
+    );
+  }
+
+  if (!provider.models.includes(nextModel)) {
+    logger.warn(`Model "${nextModel}" is not available for the current default provider (${provider.displayName}).`);
+    logger.info(`Available models: ${provider.models.join(", ")}`);
+    logger.info("Use `codeshit config` to change the default provider.");
+    return;
+  }
+
+  config.model = nextModel;
+  ui.setModel(nextModel);
+  logger.success(`Model switched to ${nextModel} (${provider.displayName}).`);
 }
 
 function formatRunningCommands(commands: RunningCommand[]): string {
@@ -319,16 +355,17 @@ async function withProgress<T>(message: string, task: (update: ProgressUpdate) =
   let currentMessage = message;
   const activeChat = getActiveChatTerminal();
   if (activeChat) {
-    activeChat.append(`${message}...`);
+    activeChat.startWork({ label: message });
     const update: ProgressUpdate = (nextMessage) => {
       currentMessage = nextMessage;
+      activeChat.updateWork({ label: nextMessage });
     };
     try {
       const result = await task(update);
-      activeChat.append(`${currentMessage} (${formatElapsed(Date.now() - started)})`);
+      activeChat.finishWork("success", { label: currentMessage });
       return result;
     } catch (error) {
-      activeChat.append(`${currentMessage} failed (${formatElapsed(Date.now() - started)})`);
+      activeChat.finishWork("failed", { label: currentMessage, detail: `failed after ${formatElapsed(Date.now() - started)}` });
       throw error;
     }
   }
@@ -482,6 +519,7 @@ export function formatEnvironmentIssue(issue: EnvironmentIssue): string {
 
 export function shouldAttemptEnvironmentFix(issue: EnvironmentIssue): boolean {
   const text = `${issue.details.join("\n")}\n${issue.suggestions.join("\n")}`.toLowerCase();
+  if (text.includes("missing command") || text.includes("command not found") || text.includes("add \"") && text.includes("\" to path")) return false;
   if (text.includes("service was not reachable") || text.includes("start the service successfully")) return false;
   if (text.includes("maven could not resolve or download dependencies/plugins")) return false;
   if (text.includes("maven could not write to the local repository")) return false;
@@ -796,6 +834,7 @@ async function runComplexTask(params: {
   const { root, config, provider, plan, state, store, history, runStore, ui } = params;
   const totalSteps = plan.steps.length;
   const previousMode = ui?.status.getSnapshot().mode;
+  const workflowStartedAt = Date.now();
   ui?.setMode("execute");
   ui?.setState("idle");
 
@@ -809,7 +848,7 @@ async function runComplexTask(params: {
   await store.writePlan(plan);
   await store.writeState({ ...state, status: "ready" });
 
-  const shouldStart = config.autoApply || await confirmProceed(ui, "Execute this plan step by step?");
+  const shouldStart = config.autoApply || await confirmProceed(ui, "Execute this plan now? This will apply step patches and run safe validation commands; installs, long-running commands, and milestones will still ask.");
   if (!shouldStart) {
     logger.info("Plan saved. Use /resume to execute later.");
     history.push({ role: "assistant", content: `计划已保存：${plan.goal}。稍后可用 /resume 继续执行。` });
@@ -830,6 +869,7 @@ async function runComplexTask(params: {
 
   try {
     for await (const event of generator) {
+      syncWorkStatusFromExecutorEvent(event, ui, totalSteps, workflowStartedAt);
       switch (event.kind) {
         case "step_started": {
           ui?.setState("thinking");
@@ -925,16 +965,136 @@ async function runComplexTask(params: {
   }
 }
 
-function createExecutorConfirmationHandler(ui: ChatUi | undefined): (confirmation: ExecutorConfirmation) => Promise<ExecutorConfirmationResult> {
+function syncWorkStatusFromExecutorEvent(event: ExecutorEvent, ui: ChatUi | undefined, fallbackTotalSteps: number, workflowStartedAt = Date.now()): void {
+  if (!ui) return;
+  switch (event.kind) {
+    case "plan_generated":
+      ui.startWork({ label: "Task plan generated", detail: event.plan.goal, totalSteps: event.plan.steps.length, startedAt: workflowStartedAt });
+      break;
+    case "step_started":
+      ui.startWork({
+        label: event.stepTitle,
+        detail: "Starting step",
+        stepIndex: event.stepIndex + 1,
+        totalSteps: event.totalSteps,
+        startedAt: workflowStartedAt
+      });
+      break;
+    case "step_progress":
+      ui.updateWork({
+        label: normalizeProgressLabel(event.message),
+        stepIndex: event.stepIndex + 1,
+        totalSteps: fallbackTotalSteps
+      });
+      break;
+    case "step_code_plan":
+      ui.updateWork({
+        label: "Generating code",
+        detail: event.summary,
+        stepIndex: event.stepIndex + 1,
+        totalSteps: fallbackTotalSteps
+      });
+      break;
+    case "step_patch":
+      ui.updateWork({
+        label: "Applying patch",
+        detail: `${event.patchName} (${event.files.length} file${event.files.length === 1 ? "" : "s"})`,
+        stepIndex: event.stepIndex + 1,
+        totalSteps: fallbackTotalSteps
+      });
+      break;
+    case "step_files_written":
+      ui.updateWork({
+        label: "Running verification",
+        detail: event.files.length > 0 ? `Wrote ${event.files.length} file${event.files.length === 1 ? "" : "s"}` : undefined,
+        stepIndex: event.stepIndex + 1,
+        totalSteps: fallbackTotalSteps
+      });
+      break;
+    case "step_verification": {
+      const passed = event.results.filter((result) => result.exitCode === 0).length;
+      ui.updateWork({
+        label: "Verification complete",
+        detail: `${passed}/${event.results.length} command${event.results.length === 1 ? "" : "s"} passed`,
+        stepIndex: event.stepIndex + 1,
+        totalSteps: fallbackTotalSteps
+      });
+      break;
+    }
+    case "step_repair":
+      ui.updateWork({
+        label: `Repair attempt ${event.attempt}/${event.maxAttempts}`,
+        stepIndex: event.stepIndex + 1,
+        totalSteps: fallbackTotalSteps
+      });
+      break;
+    case "step_environment_issue":
+      ui.updateWork({
+        label: "Environment issue",
+        detail: event.message,
+        stepIndex: event.stepIndex + 1,
+        totalSteps: fallbackTotalSteps
+      });
+      break;
+    case "step_command_deferred":
+      ui.updateWork({
+        label: "Command deferred",
+        detail: event.command,
+        stepIndex: event.stepIndex + 1,
+        totalSteps: fallbackTotalSteps
+      });
+      break;
+    case "step_completed":
+      ui.updateWork({
+        label: `Step ${event.result.stepId} complete`,
+        detail: event.result.summary,
+        stepIndex: event.stepIndex + 1,
+        totalSteps: fallbackTotalSteps
+      });
+      break;
+    case "milestone":
+      ui.updateWork({
+        label: "Milestone reached",
+        detail: event.progress,
+        stepIndex: event.stepIndex + 1,
+        totalSteps: fallbackTotalSteps
+      });
+      break;
+    case "paused":
+      ui.finishWork("blocked", { label: "Task paused", detail: event.reason });
+      break;
+    case "completed": {
+      const passed = event.state.completedSteps.filter((step) => step.verificationResult === "passed").length;
+      ui.finishWork("success", { label: "Task completed", detail: `${passed}/${fallbackTotalSteps} steps passed` });
+      break;
+    }
+    case "failed":
+      ui.finishWork("failed", { label: "Task failed", detail: event.error });
+      break;
+  }
+}
+
+function normalizeProgressLabel(message: string): string {
+  return message.replace(/[.。]+$/u, "");
+}
+
+export function createExecutorConfirmationHandler(ui: ChatUi | undefined): (confirmation: ExecutorConfirmation) => Promise<ExecutorConfirmationResult> {
   return async (confirmation) => {
     if (confirmation.kind === "apply_patch") {
-      return confirmAction(ui, `Apply patch ${confirmation.patchName}?`, [
-        { value: "proceed", name: "Apply patch", description: `Write ${confirmation.files.length} file change(s).` },
-        { value: "defer", name: "Defer", description: "Save the task and apply later." },
-        { value: "cancel", name: "Cancel", description: "Stop this task without writing files." }
-      ]);
+      ui?.updateWork({
+        label: "Applying patch",
+        detail: confirmation.patchName,
+        stepIndex: confirmation.stepIndex + 1
+      });
+      return "proceed";
     }
     if (confirmation.kind === "run_command") {
+      ui?.updateWork({
+        label: "Running command",
+        detail: confirmation.command,
+        stepIndex: confirmation.stepIndex + 1
+      });
+      if (!confirmation.requiresExplicitConfirmation) return "proceed";
       return confirmAction(ui, `Run command "${confirmation.command}"?`, [
         { value: "proceed", name: "Run command", description: confirmation.reason ?? "Execute this validation command." },
         { value: "skip", name: "Skip", description: "Skip this command and pause the task." },
@@ -942,6 +1102,11 @@ function createExecutorConfirmationHandler(ui: ChatUi | undefined): (confirmatio
         { value: "cancel", name: "Cancel", description: "Stop this task." }
       ]);
     }
+    ui?.updateWork({
+      label: "Milestone reached",
+      detail: confirmation.progress,
+      stepIndex: confirmation.stepIndex + 1
+    });
     return confirmAction(ui, "Continue validation?", [
       { value: "proceed", name: "Continue", description: "Move to the next task step." },
       { value: "defer", name: "Defer", description: "Pause here and resume later." },
@@ -962,7 +1127,9 @@ async function continueTaskExecution(
   ui?: ChatUi
 ): Promise<void> {
   const totalSteps = plan.steps.length;
+  const workflowStartedAt = Date.now();
   for await (const event of generator) {
+    syncWorkStatusFromExecutorEvent(event, ui, totalSteps, workflowStartedAt);
     switch (event.kind) {
       case "step_started":
         ui?.setState("thinking");
@@ -1247,6 +1414,10 @@ export async function chatCommand(root: string, options: ChatCliOptions): Promis
     }
     if (parsed.kind === "diff") {
       await withProgress("Loading diff", () => diffCommand(root));
+      continue;
+    }
+    if (parsed.kind === "model") {
+      await handleModelCommand(config, parsed.model, ui);
       continue;
     }
     if (parsed.kind === "tasks") {

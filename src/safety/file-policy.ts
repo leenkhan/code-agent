@@ -16,6 +16,8 @@ export const blockedReadPatterns = [
 export const blockedWritePatterns = [
   ".git/**",
   "node_modules/**",
+  "venv/**",
+  ".venv/**",
   "dist/**",
   "build/**",
   ".next/**",
@@ -24,6 +26,18 @@ export const blockedWritePatterns = [
   ".env",
   ".env.*"
 ];
+
+const blockedWriteDirectoryNames = new Set([
+  ".git",
+  "node_modules",
+  "venv",
+  ".venv",
+  "dist",
+  "build",
+  ".next",
+  ".nuxt",
+  "coverage"
+]);
 
 function normalizePath(filePath: string): string {
   return filePath.split(path.sep).join("/").replace(/^\.\//, "");
@@ -49,12 +63,16 @@ function matchesAny(filePath: string, patterns: string[]): boolean {
   return patterns.some((pattern) => matchesPattern(normalized, pattern));
 }
 
+function containsBlockedWriteDirectory(filePath: string): boolean {
+  return normalizePath(filePath).split("/").some((segment) => blockedWriteDirectoryNames.has(segment));
+}
+
 export function canReadFile(filePath: string): boolean {
   return !matchesAny(filePath, blockedReadPatterns);
 }
 
 export function canWriteFile(filePath: string): boolean {
-  return !matchesAny(filePath, blockedWritePatterns) && canReadFile(filePath);
+  return !containsBlockedWriteDirectory(filePath) && !matchesAny(filePath, blockedWritePatterns) && canReadFile(filePath);
 }
 
 export function assertReadableFile(filePath: string): void {

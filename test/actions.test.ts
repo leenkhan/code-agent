@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { execa } from "execa";
-import { applyFileActions, generateCodeActionPlan, parseCodeActionPlan, validateCodeActionPlan } from "../src/agent/actions.js";
+import { applyFileActions, generateCodeActionPlan, generateEnvironmentFix, parseCodeActionPlan, validateCodeActionPlan } from "../src/agent/actions.js";
 import type { LlmProvider } from "../src/llm/provider.js";
 
 describe("code actions", () => {
@@ -31,6 +31,46 @@ describe("code actions", () => {
     });
 
     expect(errors.join("\n")).toContain("Path traversal blocked");
+  });
+
+  it("blocks writes into virtual environment directories", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-actions-"));
+    const errors = validateCodeActionPlan(root, {
+      summary: "bad",
+      files: [{ path: "backserve/venv/bin/python", content: "#!/bin/sh\n" }],
+      commands: []
+    });
+
+    expect(errors.join("\n")).toContain("Forbidden write path blocked");
+  });
+
+  it("drops unsafe generated environment fix files", async () => {
+    const provider: LlmProvider = {
+      async generateText() {
+        return JSON.stringify({
+          files: [{ path: "backserve/venv/bin/python", content: "#!/bin/sh\n" }],
+          commands: []
+        });
+      }
+    };
+
+    const fix = await generateEnvironmentFix({
+      provider,
+      model: "test-model",
+      issue: {
+        summary: "Validation stopped because the local development environment is missing required tools or services.",
+        details: ["Missing command while running \"python -c pass\": python"],
+        suggestions: ["Install or add \"python\" to PATH, then rerun the command."]
+      },
+      context: {
+        root: "/tmp/project",
+        fileTree: [],
+        importantFiles: []
+      },
+      failedCommand: "python -c pass"
+    });
+
+    expect(fix).toBeNull();
   });
 
   it("can require file actions for code change tasks", async () => {

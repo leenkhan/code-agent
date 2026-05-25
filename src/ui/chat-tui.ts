@@ -2,8 +2,23 @@ import readline from "node:readline";
 import type { ReadStream, WriteStream } from "node:tty";
 import { setLoggerSink } from "./logger.js";
 import { displayWidth, fitDisplayLine, renderMarkdown, wrapDisplayLine } from "./markdown.js";
-import { ChatStatusBar, formatStatusBar, type ChatMode, type RuntimeState, type StatusSnapshot } from "./status-bar.js";
+import {
+  ChatStatusBar,
+  formatStatusBar,
+  formatWorkStatusLine,
+  type ChatMode,
+  type RuntimeState,
+  type StatusSnapshot,
+  type WorkStatusSnapshot,
+  type WorkStatusState
+} from "./status-bar.js";
 import { actionFromConfirmation, defaultConfirmationChoices, type ConfirmationAction, type ConfirmationChoice } from "./selection.js";
+
+export type ChatSelectChoice<T extends string = string> = {
+  value: T;
+  name: string;
+  description?: string;
+};
 
 export type ChatInputResult =
   | { kind: "line"; value: string }
@@ -24,7 +39,7 @@ export type ChatTerminalStreams = {
 
 type SelectionState = {
   message: string;
-  choices: ConfirmationChoice[];
+  choices: ChatSelectChoice[];
   index: number;
 };
 
@@ -44,7 +59,7 @@ export function getActiveChatTerminal(): ChatTerminal | undefined {
 }
 
 export function isPlanExitShortcutKey(key: KeypressLike): boolean {
-  return (key.name === "tab" && key.shift === true) || key.sequence === "\u001b[Z";
+  return key.name === "tab" && key.shift === true;
 }
 
 export function renderChatFrame(input: {
@@ -53,22 +68,23 @@ export function renderChatFrame(input: {
   inputValue: string;
   selection?: SelectionState;
   status: StatusSnapshot;
+  workStatus?: WorkStatusSnapshot;
   columns: number;
   rows: number;
 }): string[] {
   const columns = Math.max(input.columns, 20);
   const rows = Math.max(input.rows, 8);
   const selectionLines = input.selection ? 1 + input.selection.choices.length : 0;
-  const fixedLines = 3 + selectionLines + 1;
-  const historyHeight = Math.max(rows - fixedLines, 1);
-  const historyLines = input.history
-    .flatMap((line) => wrapDisplayLine(line, columns))
-    .slice(-historyHeight);
+  const fixedLines = 4 + selectionLines + 1;
+  const historyHeight = Math.max(rows - fixedLines, 0);
+  const wrappedHistory = input.history.flatMap((line) => wrapDisplayLine(line, columns));
+  const historyLines = historyHeight > 0 ? wrappedHistory.slice(-historyHeight) : [];
   const paddedHistory = [
     ...Array.from({ length: Math.max(historyHeight - historyLines.length, 0) }, () => ""),
     ...historyLines
   ];
   const lines = paddedHistory.map((line) => fitDisplayLine(line, columns));
+  lines.push(formatWorkStatusLine(input.workStatus, columns));
   lines.push(formatInputRow(`${input.inputLabel}> ${input.inputValue}`, columns));
   lines.push(formatInputRow("", columns));
   lines.push(formatInputRow("", columns));
@@ -94,6 +110,12 @@ export class ChatTerminal {
   private readState: ReadState | undefined;
   private selection: SelectionState | undefined;
   private previousRawMode: boolean | undefined;
+  private workStatus: WorkStatusSnapshot | undefined;
+  private workTimer: NodeJS.Timeout | undefined;
+  private resizeTimer: NodeJS.Timeout | undefined;
+  private readonly handleResize = (): void => {
+    this.scheduleResizeRender();
+  };
   private started = false;
 
   constructor(snapshot: StatusSnapshot, streams: ChatTerminalStreams = {}) {
@@ -116,6 +138,8 @@ export class ChatTerminal {
     if (typeof (this.stdin as ReadStream).setRawMode === "function") {
       (this.stdin as ReadStream).setRawMode(true);
     }
+    this.stdout.on("resize", this.handleResize);
+    process.on("SIGWINCH", this.handleResize);
     this.stdout.write("\u001b[?25l");
     this.render();
   }
@@ -124,8 +148,12 @@ export class ChatTerminal {
     if (!this.started) return;
     this.started = false;
     if (activeTerminal === this) activeTerminal = undefined;
+    this.clearWorkTimer();
+    this.clearResizeTimer();
     setLoggerSink(undefined);
     if (!this.interactive) return;
+    this.stdout.removeListener("resize", this.handleResize);
+    process.removeListener("SIGWINCH", this.handleResize);
     const ttyStdin = this.stdin as ReadStream;
     if (typeof ttyStdin.setRawMode === "function") {
       ttyStdin.setRawMode(this.previousRawMode ?? false);
@@ -142,6 +170,60 @@ export class ChatTerminal {
 
   setState(state: RuntimeState): void {
     this.status.setState(state);
+  }
+
+  setModel(model: string): void {
+    this.status.setModel(model);
+  }
+
+  startWork(work: Omit<WorkStatusSnapshot, "state" | "startedAt" | "stepStartedAt" | "finishedAt"> & Partial<Pick<WorkStatusSnapshot, "startedAt" | "stepStartedAt">>): void {
+    const now = Date.now();
+    const startedAt = work.startedAt ?? now;
+    this.workStatus = {
+      ...work,
+      state: "running",
+      startedAt,
+      stepStartedAt: work.stepStartedAt ?? now
+    };
+    this.ensureWorkTimer();
+    this.render();
+  }
+
+  updateWork(work: Partial<WorkStatusSnapshot>): void {
+    const now = Date.now();
+    const previous = this.workStatus;
+    const state = work.state ?? previous?.state ?? "running";
+    const startedAt = work.startedAt ?? previous?.startedAt ?? now;
+    const resetStepTimer = state === "running"
+      && work.stepStartedAt === undefined
+      && (
+        (work.stepIndex !== undefined && work.stepIndex !== previous?.stepIndex)
+        || (work.label !== undefined && work.label !== previous?.label)
+      );
+    this.workStatus = {
+      ...previous,
+      ...work,
+      state,
+      startedAt,
+      stepStartedAt: work.stepStartedAt ?? (resetStepTimer ? now : previous?.stepStartedAt ?? now),
+      finishedAt: state === "running" ? undefined : work.finishedAt ?? previous?.finishedAt ?? now
+    };
+    if (state === "running") this.ensureWorkTimer();
+    else this.clearWorkTimer();
+    this.render();
+  }
+
+  finishWork(
+    state: Exclude<WorkStatusState, "running" | "idle">,
+    work: Omit<Partial<WorkStatusSnapshot>, "state" | "finishedAt"> = {}
+  ): void {
+    this.updateWork({ ...work, state, finishedAt: Date.now() });
+  }
+
+  clearWork(): void {
+    this.workStatus = undefined;
+    this.clearWorkTimer();
+    this.render();
   }
 
   append(message: string): void {
@@ -199,8 +281,22 @@ export class ChatTerminal {
       return actionFromConfirmation(await confirm({ message, default: false }), choices);
     }
 
-    return new Promise<ConfirmationAction>((resolve, reject) => {
-      this.selection = { message, choices, index: 0 };
+    return this.selectOption(message, choices).then((value) => value as ConfirmationAction);
+  }
+
+  async selectOption<T extends string>(message: string, choices: ChatSelectChoice<T>[], defaultValue?: T): Promise<T> {
+    if (!this.interactive) {
+      const { select } = await import("@inquirer/prompts");
+      return select<T>({
+        message,
+        default: defaultValue,
+        choices: choices.map((choice) => ({ name: choice.name, value: choice.value, description: choice.description }))
+      });
+    }
+
+    return new Promise<string>((resolve, reject) => {
+      const defaultIndex = defaultValue ? choices.findIndex((choice) => choice.value === defaultValue) : -1;
+      this.selection = { message, choices, index: Math.max(defaultIndex, 0) };
       const onKeypress = (value: string, key: KeypressLike): void => {
         try {
           const result = this.handleSelectionKey(value, key);
@@ -219,7 +315,7 @@ export class ChatTerminal {
       };
       this.stdin.on("keypress", onKeypress);
       this.render();
-    });
+    }) as Promise<T>;
   }
 
   private handleInputKey(value: string, key: KeypressLike): ChatInputResult | undefined {
@@ -257,11 +353,11 @@ export class ChatTerminal {
     return undefined;
   }
 
-  private handleSelectionKey(value: string, key: KeypressLike): ConfirmationAction | undefined {
+  private handleSelectionKey(value: string, key: KeypressLike): string | undefined {
     if (!this.selection) return undefined;
     const selection = this.selection;
     if (key.ctrl && key.name === "c") throw new Error("interrupted");
-    if (key.name === "escape") return selection.choices.find((choice) => choice.value === "cancel")?.value ?? "cancel";
+    if (key.name === "escape") return selection.choices.find((choice) => choice.value === "cancel")?.value ?? selection.choices[0]?.value;
     if (key.name === "return" || key.name === "enter") return selection.choices[selection.index]?.value;
     if (key.name === "up" || value === "k") {
       selection.index = (selection.index - 1 + selection.choices.length) % selection.choices.length;
@@ -288,6 +384,7 @@ export class ChatTerminal {
       inputValue: readState?.buffer ?? "",
       selection: this.selection,
       status: this.status.getSnapshot(),
+      workStatus: this.workStatus,
       columns: this.stdout.columns ?? 100,
       rows: this.stdout.rows ?? 24
     });
@@ -295,14 +392,45 @@ export class ChatTerminal {
     readline.clearScreenDown(this.stdout as WriteStream);
     this.stdout.write(lines.join("\n"));
     if (readState && !this.selection) {
-      const historyRows = Math.max((this.stdout.rows ?? 24) - 4, 1);
+      const selectionLines = 0;
+      const fixedLines = 4 + selectionLines + 1;
+      const historyRows = Math.max((this.stdout.rows ?? 24) - fixedLines, 0);
+      const inputRow = historyRows + 1;
       const prefix = `you${readState.planModeActive ? " [PLAN]" : ""}> `;
       const col = Math.min(displayWidth(`${prefix}${readState.buffer.slice(0, readState.cursor)}`), (this.stdout.columns ?? 100) - 1);
-      readline.cursorTo(this.stdout as WriteStream, col, historyRows);
+      readline.cursorTo(this.stdout as WriteStream, col, inputRow);
       this.stdout.write("\u001b[?25h");
     } else {
       this.stdout.write("\u001b[?25l");
     }
+  }
+
+  private ensureWorkTimer(): void {
+    if (!this.interactive || this.workTimer) return;
+    this.workTimer = setInterval(() => {
+      this.render();
+    }, 1000);
+  }
+
+  private clearWorkTimer(): void {
+    if (!this.workTimer) return;
+    clearInterval(this.workTimer);
+    this.workTimer = undefined;
+  }
+
+  private scheduleResizeRender(): void {
+    if (!this.interactive || !this.started) return;
+    this.clearResizeTimer();
+    this.resizeTimer = setTimeout(() => {
+      this.resizeTimer = undefined;
+      if (this.started) this.render();
+    }, 0);
+  }
+
+  private clearResizeTimer(): void {
+    if (!this.resizeTimer) return;
+    clearTimeout(this.resizeTimer);
+    this.resizeTimer = undefined;
   }
 }
 

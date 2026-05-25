@@ -1,6 +1,6 @@
 import type { ProjectConfig, RuntimeConfig } from "../types.js";
 import { getEnvApiKey, getProviderDefinition } from "../llm/catalog.js";
-import { readGlobalConfig } from "./global-config.js";
+import { getDefaultGlobalProviderConfig, readGlobalConfig } from "./global-config.js";
 import { readProjectConfig } from "./project-config.js";
 import { defaultProjectConfig } from "./project-config.js";
 
@@ -22,14 +22,15 @@ function resolveModel(input: {
 
 export async function resolveRuntimeConfig(root: string, overrides: RuntimeOverrides = {}): Promise<RuntimeConfig> {
   const globalConfig = await readGlobalConfig();
+  const defaultProviderConfig = getDefaultGlobalProviderConfig(globalConfig);
   const projectConfig = await readProjectConfig(root);
-  const provider = getProviderDefinition(globalConfig.provider);
-  const envApiKey = getEnvApiKey(globalConfig.provider);
+  const provider = getProviderDefinition(defaultProviderConfig.provider);
+  const envApiKey = getEnvApiKey(defaultProviderConfig.provider);
   const model = resolveModel({
-    provider: globalConfig.provider,
+    provider: defaultProviderConfig.provider,
     overrideModel: overrides.model,
     projectModel: projectConfig.model,
-    globalModel: globalConfig.model
+    globalModel: defaultProviderConfig.model
   });
   const mergedProject: ProjectConfig = {
     ...projectConfig,
@@ -40,9 +41,9 @@ export async function resolveRuntimeConfig(root: string, overrides: RuntimeOverr
   };
   return {
     ...mergedProject,
-    provider: globalConfig.provider,
-    apiKey: envApiKey ?? globalConfig.apiKey,
-    baseUrl: globalConfig.baseUrl ?? provider.defaultBaseUrl,
+    provider: defaultProviderConfig.provider,
+    apiKey: envApiKey ?? defaultProviderConfig.apiKey,
+    baseUrl: defaultProviderConfig.baseUrl ?? provider.defaultBaseUrl,
     model
   };
 }

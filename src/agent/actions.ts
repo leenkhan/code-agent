@@ -490,6 +490,7 @@ Examples of what to generate:
 - Package manager files: package.json with required scripts
 
 Only generate files that are safe and appropriate for a development environment.
+Do NOT modify virtual environments, interpreter shims, dependency folders, or generated build output.
 Do NOT generate binaries (.jar, .exe). For binary wrappers, generate shell scripts that download the binary.`,
       prompt: `The project failed to run this command:
 $ ${input.failedCommand}
@@ -523,7 +524,24 @@ If you cannot fix this automatically, return: {"files": [], "commands": []}`
     if (!parsed.success || (parsed.data.files.length === 0 && parsed.data.commands.length === 0)) {
       return null;
     }
-    return parsed.data;
+    const files = parsed.data.files.filter((file) => {
+      try {
+        normalizeActionPath(file.path);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    const commands = parsed.data.commands.filter((command) => {
+      try {
+        assertCommandAllowed(command.command);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    if (files.length === 0 && commands.length === 0) return null;
+    return { files, commands };
   } catch {
     return null;
   }

@@ -1,14 +1,11 @@
 import path from "node:path";
 import { createRequire } from "node:module";
-import fg from "fast-glob";
-import ignore from "ignore";
-import fs from "fs-extra";
 import type { CodeDiagnostic, CodeSymbol, ProjectConfig, ProjectContext } from "../types.js";
-import { canReadFile } from "../safety/file-policy.js";
 import { gitDiff, gitStatus, isGitRepo } from "../tools/git.js";
 import { importantFileGlobs } from "./detect.js";
 import { buildProjectProfile, allSourceGlobs } from "./profile.js";
 import { readSmallTextFile } from "./files.js";
+import { safeProjectGlob } from "./glob.js";
 
 const maxFileBytes = 100 * 1024;
 const maxFiles = 500;
@@ -45,15 +42,6 @@ type LoadedTextFile = {
 
 const require = createRequire(import.meta.url);
 let treeSitterRuntimePromise: Promise<TreeSitterRuntime | undefined> | undefined;
-
-async function buildIgnore(root: string, config: ProjectConfig): Promise<ReturnType<typeof ignore>> {
-  const ig = ignore().add(config.ignore);
-  const gitignorePath = path.join(root, ".gitignore");
-  if (await fs.pathExists(gitignorePath)) {
-    ig.add(await fs.readFile(gitignorePath, "utf8"));
-  }
-  return ig;
-}
 
 function isTypeScriptLike(filePath: string): boolean {
   return /\.(ts|tsx|js|jsx|mts|cts)$/i.test(filePath);
@@ -421,24 +409,9 @@ async function collectSemanticContext(files: LoadedTextFile[]): Promise<{ symbol
 }
 
 export async function collectProjectContext(root: string, config: ProjectConfig, task?: string): Promise<ProjectContext> {
-  const ig = await buildIgnore(root, config);
-  const allFiles = await fg(["**/*"], {
-    cwd: root,
-    dot: true,
-    onlyFiles: true,
-    absolute: false,
-    followSymbolicLinks: false
-  });
-  const safeFiles = allFiles
-    .filter((file) => canReadFile(file))
-    .filter((file) => !ig.ignores(file))
-    .slice(0, maxFiles);
-  const importantCandidates = await fg(["README.md", ...importantFileGlobs, "vite.config.*", "next.config.*", ...sourceFileGlobs], {
-    cwd: root,
-    dot: true,
-    onlyFiles: true,
-    absolute: false
-  });
+  const allFiles = await safeProjectGlob(["**/*"], root, { config });
+  const safeFiles = allFiles.slice(0, maxFiles);
+  const importantCandidates = await safeProjectGlob(["README.md", ...importantFileGlobs, "vite.config.*", "next.config.*", ...sourceFileGlobs], root, { config });
   const importantFiles: LoadedTextFile[] = [];
   let totalBytes = 0;
   for (const relative of importantCandidates.filter((file) => safeFiles.includes(file)).slice(0, maxImportantFiles)) {

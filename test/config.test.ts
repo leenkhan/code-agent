@@ -13,6 +13,13 @@ describe("project config defaults", () => {
 
 describe("global config defaults", () => {
   it("uses DeepSeek's Anthropic-compatible endpoint by default", () => {
-    expect(defaultGlobalConfig.baseUrl).toBe("https://api.deepseek.com/anthropic");
+    expect(defaultGlobalConfig.providers).toEqual([
+      {
+        provider: "deepseek",
+        model: "deepseek-v4-pro",
+        baseUrl: "https://api.deepseek.com/anthropic",
+        isDefault: true
+      }
+    ]);
   });
 });

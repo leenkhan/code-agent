@@ -1,5 +1,5 @@
-import fg from "fast-glob";
 import { allImportantFiles, allRootMarkers, buildProjectProfile, detectValidationCommandsFromProfileOnDisk } from "./profile.js";
+import { safeProjectGlob } from "./glob.js";
 
 export const importantFileGlobs = unique([
   "package.json",
@@ -28,11 +28,11 @@ export const importantFileGlobs = unique([
 ]);
 
 export async function detectImportantFiles(root: string): Promise<string[]> {
-  return fg(importantFileGlobs, { cwd: root, dot: true, onlyFiles: true, absolute: false });
+  return safeProjectGlob(importantFileGlobs, root);
 }
 
 export async function detectValidationCommands(root: string): Promise<string[]> {
-  const files = await fg(["**/*"], { cwd: root, dot: true, onlyFiles: true, followSymbolicLinks: false });
+  const files = await safeProjectGlob(["**/*"], root);
   const profile = buildProjectProfile(files);
   return detectValidationCommandsFromProfileOnDisk(root, profile);
 }
