@@ -127,8 +127,10 @@ vi.mock("@inquirer/prompts", () => ({
 
 import { chatCommand } from "../src/commands/chat.js";
 import { createLlmProvider } from "../src/llm/factory.js";
-import { confirm } from "@inquirer/prompts";
+import { confirm, select } from "@inquirer/prompts";
 import type { LlmProvider } from "../src/llm/provider.js";
+import { createTaskStore } from "../src/state/task-store.js";
+import type { TaskPlan, TaskState } from "../src/types.js";
 
 vi.mock("../src/llm/factory.js", () => ({
   createLlmProvider: vi.fn()
@@ -310,6 +312,59 @@ function resetMockState() {
   ];
 }
 
+async function writeSavedTask(root: string, params: {
+  goal: string;
+  status: TaskState["status"];
+  updatedAt: string;
+  filePath: string;
+  fileContent: string;
+}): Promise<string> {
+  const store = await createTaskStore(root, params.goal);
+  const plan: TaskPlan = {
+    goal: params.goal,
+    steps: [{
+      id: "1",
+      title: `Write ${params.filePath}`,
+      description: `Create ${params.filePath} with the selected content.`,
+      expectedFiles: [params.filePath],
+      verification: "",
+      milestone: false,
+      dependsOn: []
+    }]
+  };
+  const state: TaskState = {
+    taskId: store.taskId,
+    status: params.status,
+    currentStepIndex: 0,
+    completedSteps: [],
+    knownFailures: [],
+    createdAt: params.updatedAt,
+    updatedAt: params.updatedAt
+  };
+
+  await store.writePlan(plan);
+  await store.writeState(state);
+  return store.taskId;
+}
+
+function makeResumeSelectionProvider(filePath: string, fileContent: string): LlmProvider {
+  return {
+    async generateText(input) {
+      if (input.responseFormat === "json_object" && input.prompt.includes("Return JSON with this exact shape")) {
+        return JSON.stringify({
+          summary: `Create ${filePath}`,
+          files: [{ path: filePath, content: fileContent }],
+          commands: []
+        });
+      }
+      if (input.prompt.includes("Summarize the result")) {
+        return `Created ${filePath}.`;
+      }
+      return JSON.stringify({ intent: "answer", answer: "done" });
+    }
+  };
+}
+
 describe("chat integration: model switching", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
@@ -485,6 +540,22 @@ describe("chat integration: plan command", () => {
     expect(calls).toEqual([]);
   });
 
+  it("records recognized slash command usage globally", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-chat-usage-"));
+    vi.stubEnv("DEEPSEEK_API_KEY", "test-key");
+    mockState.inputs = ["/help", "/quit"];
+    const { provider } = makePlanOnlyProvider();
+    vi.mocked(createLlmProvider).mockReturnValue(provider);
+
+    await chatCommand(root, { autoApply: true, model: "deepseek-v4-pro" });
+
+    const usage = JSON.parse(await fs.readFile(path.join(testHome, ".codeshit", "chat-command-usage.json"), "utf8")) as Record<string, number>;
+    expect(usage).toMatchObject({
+      "/help": 1,
+      "/exit": 1
+    });
+  });
+
   it("applies multi-turn plan mode by generating a task plan and saving it when execution is declined", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-chat-apply-plan-"));
     vi.stubEnv("DEEPSEEK_API_KEY", "test-key");
@@ -570,6 +641,71 @@ describe("chat integration: repair loop on broken code", () => {
     const tscResult = await execa("npx", ["tsc", "--noEmit"], { cwd: root, reject: false });
     expect(tscResult.exitCode).not.toBe(0);
   }, 30000);
+});
+
+describe("chat integration: resume picker", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.clearAllMocks();
+    resetMockState();
+  });
+
+  it("uses the selected task when /resume is invoked without a task id in non-interactive mode", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "code-agent-chat-resume-picker-"));
+    vi.stubEnv("DEEPSEEK_API_KEY", "test-key");
+
+    const newestTaskId = await writeSavedTask(root, {
+      goal: "Newest paused task",
+      status: "paused",
+      updatedAt: "2026-05-25T12:02:00.000Z",
+      filePath: "src/newest.ts",
+      fileContent: "export const picked = 'newest';\n"
+    });
+    const selectedTaskId = await writeSavedTask(root, {
+      goal: "Blocked task to select",
+      status: "blocked",
+      updatedAt: "2026-05-25T12:01:00.000Z",
+      filePath: "src/selected.ts",
+      fileContent: "export const picked = 'selected';\n"
+    });
+    await writeSavedTask(root, {
+      goal: "Completed task",
+      status: "completed",
+      updatedAt: "2026-05-25T12:00:00.000Z",
+      filePath: "src/completed.ts",
+      fileContent: "export const picked = 'completed';\n"
+    });
+
+    mockState.inputs = ["/resume", "/exit"];
+    vi.mocked(select).mockResolvedValue(selectedTaskId);
+    vi.mocked(createLlmProvider).mockReturnValue(
+      makeResumeSelectionProvider("src/selected.ts", "export const picked = 'selected';\n")
+    );
+
+    await chatCommand(root, { autoApply: true, model: "deepseek-v4-pro" });
+
+    expect(select).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(select).mock.calls[0]?.[0]).toMatchObject({
+      message: "Choose a task to resume:",
+      default: newestTaskId
+    });
+    expect(vi.mocked(select).mock.calls[0]?.[0].choices).toEqual([
+      {
+        name: newestTaskId,
+        value: newestTaskId,
+        description: "Newest paused task | paused | 2026-05-25T12:02:00.000Z"
+      },
+      {
+        name: selectedTaskId,
+        value: selectedTaskId,
+        description: "Blocked task to select | blocked | 2026-05-25T12:01:00.000Z"
+      }
+    ]);
+
+    await expect(fs.readFile(path.join(root, "src/selected.ts"), "utf8")).resolves.toBe("export const picked = 'selected';\n");
+    await expect(fs.readFile(path.join(root, "src/newest.ts"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.readFile(path.join(root, "src/completed.ts"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
 });
 
 // ── Go project fixtures ──────────────────────────────────────────────

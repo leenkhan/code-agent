@@ -8,4 +8,5 @@
 - Legacy single-provider global config is still accepted and is normalized into the new multi-provider shape.
 - Runtime config uses the provider marked with `isDefault: true`; CLI and project `model` overrides only change the model name and do not switch providers.
 - Chat adds `/model [model]` for session-local model switching within the current default provider only.
+- Chat `/resume` without a task id now opens a picker for paused, blocked, running, or failed tasks, and auto-resumes when only one resumable task exists.
 - `codeshit doctor` now reports the default provider/model and lists configured LLM providers.
