@@ -83,6 +83,7 @@ export function isPlanExitShortcutKey(key: KeypressLike): boolean {
 
 export function renderChatFrame(input: {
   history: string[];
+  historyScrollOffset?: number;
   inputLabel: string;
   inputValue: string;
   selection?: SelectionState;
@@ -99,7 +100,11 @@ export function renderChatFrame(input: {
   const fixedLines = 4 + autocompleteLines + selectionLines + 1;
   const historyHeight = Math.max(rows - fixedLines, 0);
   const wrappedHistory = input.history.flatMap((line) => wrapDisplayLine(line, columns));
-  const historyLines = historyHeight > 0 ? wrappedHistory.slice(-historyHeight) : [];
+  const maxHistoryScrollOffset = Math.max(wrappedHistory.length - historyHeight, 0);
+  const historyScrollOffset = Math.min(Math.max(input.historyScrollOffset ?? 0, 0), maxHistoryScrollOffset);
+  const historyEnd = historyHeight > 0 ? wrappedHistory.length - historyScrollOffset : 0;
+  const historyStart = Math.max(historyEnd - historyHeight, 0);
+  const historyLines = historyHeight > 0 ? wrappedHistory.slice(historyStart, historyEnd) : [];
   const paddedHistory = [
     ...Array.from({ length: Math.max(historyHeight - historyLines.length, 0) }, () => ""),
     ...historyLines
@@ -141,6 +146,7 @@ export class ChatTerminal {
   private selection: SelectionState | undefined;
   private previousRawMode: boolean | undefined;
   private workStatus: WorkStatusSnapshot | undefined;
+  private historyScrollOffset = 0;
   private workTimer: NodeJS.Timeout | undefined;
   private resizeTimer: NodeJS.Timeout | undefined;
   private readonly handleResize = (): void => {
@@ -263,6 +269,7 @@ export class ChatTerminal {
     if (this.history.length > 1000) {
       this.history = this.history.slice(-1000);
     }
+    this.historyScrollOffset = 0;
     this.render();
   }
 
@@ -355,6 +362,7 @@ export class ChatTerminal {
     if (state.planModeActive && isPlanExitShortcutKey(key)) return { kind: "plan_exit_shortcut" };
     if (key.ctrl && key.name === "c") throw new Error("interrupted");
     if (key.name === "return" || key.name === "enter") return { kind: "line", value: state.buffer };
+    if (this.handleHistoryScrollKey(key)) return undefined;
     if (key.name === "escape") {
       if (this.currentAutocomplete()) {
         state.autocompleteHidden = true;
@@ -419,6 +427,7 @@ export class ChatTerminal {
     if (!this.selection) return undefined;
     const selection = this.selection;
     if (key.ctrl && key.name === "c") throw new Error("interrupted");
+    if (this.handleHistoryScrollKey(key)) return undefined;
     if (key.name === "escape") return selection.choices.find((choice) => choice.value === "cancel")?.value ?? selection.choices[0]?.value;
     if (key.name === "return" || key.name === "enter") return selection.choices[selection.index]?.value;
     if (key.name === "up" || value === "k") {
@@ -443,6 +452,7 @@ export class ChatTerminal {
     const autocomplete = this.currentAutocomplete();
     const lines = renderChatFrame({
       history: this.history,
+      historyScrollOffset: this.historyScrollOffset,
       inputLabel: readState?.planModeActive ? "you [PLAN]" : "you",
       inputValue: readState?.buffer ?? "",
       selection: this.selection,
@@ -468,6 +478,37 @@ export class ChatTerminal {
     } else {
       this.stdout.write("\u001b[?25l");
     }
+  }
+
+  private handleHistoryScrollKey(key: KeypressLike): boolean {
+    if (key.name !== "pageup" && key.name !== "pagedown") return false;
+    const metrics = this.historyScrollMetrics();
+    if (key.name === "pageup") {
+      this.historyScrollOffset = key.ctrl
+        ? metrics.maxOffset
+        : Math.min(this.historyScrollOffset + metrics.pageSize, metrics.maxOffset);
+    } else {
+      this.historyScrollOffset = key.ctrl
+        ? 0
+        : Math.max(this.historyScrollOffset - metrics.pageSize, 0);
+    }
+    this.render();
+    return true;
+  }
+
+  private historyScrollMetrics(): { pageSize: number; maxOffset: number } {
+    const columns = this.stdout.columns ?? 100;
+    const rows = this.stdout.rows ?? 24;
+    const autocomplete = this.currentAutocomplete();
+    const autocompleteLines = autocomplete ? Math.min(autocomplete.suggestions.length, 6) : 0;
+    const selectionLines = this.selection ? 1 + this.selection.choices.length : 0;
+    const fixedLines = 4 + autocompleteLines + selectionLines + 1;
+    const historyHeight = Math.max(rows - fixedLines, 0);
+    const wrappedHistory = this.history.flatMap((line) => wrapDisplayLine(line, Math.max(columns, 20)));
+    return {
+      pageSize: Math.max(historyHeight - 1, 1),
+      maxOffset: Math.max(wrappedHistory.length - historyHeight, 0)
+    };
   }
 
   private ensureWorkTimer(): void {

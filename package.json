@@ -1,6 +1,6 @@
 {
   "name": "@codeshit/cli",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Local-first coding agent for messy codebases",
   "type": "module",
   "bin": {
@@ -42,6 +42,8 @@
   },
   "dependencies": {
     "@inquirer/prompts": "^7.3.2",
+    "@langchain/core": "^1.0.6",
+    "@langchain/langgraph": "^1.0.2",
     "chalk": "^5.4.1",
     "commander": "^13.1.0",
     "diff": "^7.0.0",

@@ -6,6 +6,8 @@ It reads your project, plans changes, shows patch diffs before writing, applies 
 
 > CodeShit is a 0.x tool. It is patch-based, confirmation-oriented, and local-first, but command behavior and UX may still change quickly.
 
+As of `0.3.3`, CodeShit uses LangGraph internally for agent workflow orchestration. This is embedded in the local CLI runtime; it does not add a backend service, LangGraph server, remote execution, or web UI.
+
 ## Install
 
 Install globally:
@@ -193,6 +195,8 @@ Inside interactive chat:
 /plan [goal]       Enter multi-turn Plan Mode; does not edit files or run commands
 /apply-plan        Convert the current Plan Mode discussion into an executable task plan
 Shift+Tab          Leave Plan Mode and return to normal chat
+PageUp/PageDown    Scroll long chat output
+Ctrl+PageUp/Down   Jump to the top or bottom of long chat output
 /clear             Clear in-memory conversation history
 /exit, /quit       Leave chat
 ```
@@ -202,6 +206,8 @@ Shift+Tab          Leave Plan Mode and return to normal chat
 In chat, `/resume <task-id>` resumes the specified task directly. Bare `/resume` opens a picker for paused, blocked, running, or failed tasks; if there is only one resumable task, CodeShit resumes it immediately.
 
 For long-running dev servers such as `npm run dev`, `pnpm dev`, `vite`, or `mvn spring-boot:run`, CodeShit can start a background process and return to the prompt. Internal service-control commands use the `codeshit` command namespace, for example `codeshit list-services 8000`.
+
+Long review reports, plans, patches, validation logs, and task output can be scrolled inside the chat frame with `PageUp` and `PageDown`. New output returns the view to the bottom so active task progress stays visible.
 
 ## Multi-Step Tasks
 
@@ -239,6 +245,8 @@ Run artifacts are stored in:
   step-2-add-user-fields.diff
   result.json
 ```
+
+The task executor, one-shot run/fix flows, plan-only flow, chat `/apply-plan`, and resume paths are routed through the local LangGraph orchestration layer while preserving the same CLI events, confirmation gates, artifacts, and task-state files.
 
 ## Safety Model
 
@@ -321,7 +329,7 @@ Validate the packed CLI in a temp project before publishing:
 
 ```bash
 npm pack --dry-run
-npm install -g ./codeshit-cli-0.3.2.tgz
+npm install -g ./codeshit-cli-0.3.3.tgz
 codeshit --help
 codeshit doctor
 ```

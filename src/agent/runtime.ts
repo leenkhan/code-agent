@@ -13,6 +13,7 @@ import { generatePatch } from "./coder.js";
 import { generateRepairPatch } from "./repairer.js";
 import { validatePatch } from "../patch/validate.js";
 import { applyPatch, checkPatchApplies } from "../patch/apply.js";
+import { runLangGraphTask } from "./graph/langgraph.js";
 
 export type RunOptions = {
   root: string;
@@ -65,9 +66,9 @@ async function confirmPatch(patch: string, autoApply: boolean): Promise<boolean>
 
 export async function executePlanOnly(options: RunOptions): Promise<void> {
   const store = await createRunStore(options.root, options.task);
-  const context = await collectProjectContext(options.root, options.config, options.task);
+  const context = await runLangGraphTask("collect_plan_context", () => collectProjectContext(options.root, options.config, options.task));
   await saveInitialArtifacts(store, options.task, context);
-  const plan = await generatePlan(options.provider, options.task, context, options.config.model);
+  const plan = await runLangGraphTask("generate_plan", () => generatePlan(options.provider, options.task, context, options.config.model));
   await store.writeText("plan.md", plan);
   logger.heading("Plan");
   logger.info(plan);
@@ -94,9 +95,9 @@ export async function executeRun(options: RunOptions): Promise<RunResult> {
     return result;
   };
 
-  const context = await collectProjectContext(options.root, options.config, options.task);
+  const context = await runLangGraphTask("collect_run_context", () => collectProjectContext(options.root, options.config, options.task));
   await saveInitialArtifacts(store, options.task, context);
-  const plan = await generatePlan(options.provider, options.task, context, options.config.model);
+  const plan = await runLangGraphTask("generate_run_plan", () => generatePlan(options.provider, options.task, context, options.config.model));
   await store.writeText("plan.md", plan);
   logger.heading("Plan");
   logger.info(plan);
@@ -104,7 +105,7 @@ export async function executeRun(options: RunOptions): Promise<RunResult> {
     return finish("cancelled");
   }
 
-  const patch = await generatePatch(options.provider, options.task, plan, context, options.config.model);
+  const patch = await runLangGraphTask("generate_patch", () => generatePatch(options.provider, options.task, plan, context, options.config.model));
   await store.writeText("patch.diff", patch);
   if (patch.startsWith("NEED_MORE_CONTEXT:")) {
     logger.warn(patch);
@@ -147,15 +148,17 @@ export async function executeRun(options: RunOptions): Promise<RunResult> {
     return finish("success");
   }
 
-  let results = await runValidation(options.root, commands);
+  let results = await runLangGraphTask("run_validation", () => runValidation(options.root, commands));
   await store.writeText("validation.log", formatValidationLog(results));
   validationPassed = allPassed(results);
 
   while (!validationPassed && repairAttempts < options.config.maxRepairAttempts) {
     repairAttempts += 1;
     logger.warn(`Validation failed. Attempting repair ${repairAttempts}/${options.config.maxRepairAttempts}.`);
-    const repairContext = await collectProjectContext(options.root, options.config, options.task);
-    const repairPatch = await generateRepairPatch(options.provider, options.task, repairContext, results, await gitDiff(options.root), options.config.model);
+    const repairContext = await runLangGraphTask("collect_repair_context", () => collectProjectContext(options.root, options.config, options.task));
+    const repairPatch = await runLangGraphTask("generate_repair_patch", async () =>
+      generateRepairPatch(options.provider, options.task, repairContext, results, await gitDiff(options.root), options.config.model)
+    );
     await store.writeText(`repair-${repairAttempts}.diff`, repairPatch);
     if (repairPatch.startsWith("NEED_MORE_CONTEXT:")) {
       logger.warn(repairPatch);
@@ -180,7 +183,7 @@ export async function executeRun(options: RunOptions): Promise<RunResult> {
       break;
     }
     await applyPatch(options.root, repairPath);
-    results = await runValidation(options.root, commands);
+    results = await runLangGraphTask("run_repair_validation", () => runValidation(options.root, commands));
     await store.writeText(`repair-${repairAttempts}.log`, formatValidationLog(results));
     validationPassed = allPassed(results);
   }

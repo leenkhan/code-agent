@@ -8,6 +8,7 @@ import { requiresInstallConfirmation } from "../safety/command-policy.js";
 import type { TaskStore } from "../state/task-store.js";
 import { buildStepResult, summarizeStepResult } from "./context-mgr.js";
 import { buildProjectProfile, classifyEnvironmentFailures, shouldAttemptEnvironmentFix } from "../project/profile.js";
+import { runLangGraphTask } from "./graph/langgraph.js";
 
 export type ExecutorEvent =
   | { kind: "plan_generated"; plan: TaskPlan }
@@ -44,7 +45,7 @@ export async function* executeTask(params: {
   confirm?: (confirmation: ExecutorConfirmation) => Promise<ExecutorConfirmationResult>;
 }): AsyncGenerator<ExecutorEvent> {
   const { root, config, provider, plan, state, store, patchArtifactDir, confirm } = params;
-  const initialContext = await collectProjectContext(root, config, plan.goal);
+  const initialContext = await runLangGraphTask("task_collect_initial_context", () => collectProjectContext(root, config, plan.goal));
   const projectProfile = initialContext.profile ?? buildProjectProfile(initialContext.fileTree);
 
   state.status = "running";
@@ -81,7 +82,7 @@ export async function* executeTask(params: {
 
     // Build context for this step
     yield { kind: "step_progress", stepIndex: i, message: "Collecting context..." };
-    const context = await collectProjectContext(root, config, step.description);
+    const context = await runLangGraphTask("task_collect_step_context", () => collectProjectContext(root, config, step.description));
     const activeProfile = context.profile ?? projectProfile;
 
     const commandOnlyActionPlan = buildCommandOnlyActionPlan(step, plan.goal);
@@ -93,7 +94,7 @@ export async function* executeTask(params: {
       // steps must not rewrite the project just to run build/test/curl commands.
       yield { kind: "step_progress", stepIndex: i, message: "Generating code..." };
       try {
-        actionPlan = await generateCodeActionPlan({
+        actionPlan = await runLangGraphTask("task_generate_code_actions", () => generateCodeActionPlan({
           provider,
           model: config.model,
           task: `Step [${step.id}] ${step.title}: ${step.description}\n\nVerification: ${step.verification}\n\nGoal: ${plan.goal}`,
@@ -101,7 +102,7 @@ export async function* executeTask(params: {
           onProgress: () => {
             // progress is tracked via events, no-op for inline updates
           }
-        });
+        }));
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         state.status = "failed";
@@ -127,7 +128,7 @@ export async function* executeTask(params: {
     const filesChanged: string[] = [];
     if (actionPlan.files.length > 0) {
       const patchName = `step-${i + 1}-${step.id}.diff`;
-      const patchPreview = await createFileActionsPatch(root, actionPlan.files);
+      const patchPreview = await runLangGraphTask("task_create_patch_preview", () => createFileActionsPatch(root, actionPlan.files));
       if (patchPreview.patch.trim()) {
         yield { kind: "step_patch", stepIndex: i, patchName, patch: patchPreview.patch, files: patchPreview.filesChanged };
       }
@@ -144,10 +145,10 @@ export async function* executeTask(params: {
         yield { kind: "paused", reason: state.blockedReason ?? "Task paused before applying patch.", state };
         return;
       }
-      await applyFileActions(root, actionPlan.files, {
+      await runLangGraphTask("task_apply_patch", () => applyFileActions(root, actionPlan.files, {
         artifactDir: patchArtifactDir,
         patchName
-      });
+      }));
       filesChanged.push(...actionPlan.files.map((f) => f.path));
       yield { kind: "step_files_written", stepIndex: i, files: filesChanged };
     }
@@ -170,7 +171,7 @@ export async function* executeTask(params: {
           requiresExplicitConfirmation: true
         });
         if (decision === "proceed") {
-          const result = await runValidationCommand(root, cmd.command);
+          const result = await runLangGraphTask("task_run_confirmed_command", () => runValidationCommand(root, cmd.command));
           validationResults.push(result);
           continue;
         }
@@ -199,7 +200,7 @@ export async function* executeTask(params: {
         yield { kind: "paused", reason: state.blockedReason ?? "Task paused before running command.", state };
         return;
       }
-      const result = await runValidationCommand(root, cmd.command);
+      const result = await runLangGraphTask("task_run_validation_command", () => runValidationCommand(root, cmd.command));
 
       const envIssue = classifyEnvironmentFailures([result], activeProfile);
       if (envIssue) {
@@ -207,19 +208,19 @@ export async function* executeTask(params: {
 
         if (shouldAttemptEnvironmentFix(envIssue)) {
           // Try to fix the environment issue
-          const fixContext = await collectProjectContext(root, config, result.command);
-          const fix = await generateEnvironmentFix({
+          const fixContext = await runLangGraphTask("task_collect_environment_fix_context", () => collectProjectContext(root, config, result.command));
+          const fix = await runLangGraphTask("task_generate_environment_fix", () => generateEnvironmentFix({
             provider,
             model: config.model,
             issue: envIssue,
             context: fixContext,
             failedCommand: result.command
-          });
+          }));
 
           if (fix && (fix.files.length > 0 || fix.commands.length > 0)) {
             if (fix.files.length > 0) {
               const patchName = `step-${i + 1}-${step.id}-environment-fix.diff`;
-              const patchPreview = await createFileActionsPatch(root, fix.files);
+              const patchPreview = await runLangGraphTask("task_create_environment_patch", () => createFileActionsPatch(root, fix.files));
               if (patchPreview.patch.trim()) {
                 yield { kind: "step_patch", stepIndex: i, patchName, patch: patchPreview.patch, files: patchPreview.filesChanged };
               }
@@ -236,23 +237,23 @@ export async function* executeTask(params: {
                 yield { kind: "paused", reason: state.blockedReason ?? "Task paused before applying environment fix.", state };
                 return;
               }
-              await applyFileActions(root, fix.files, {
+              await runLangGraphTask("task_apply_environment_patch", () => applyFileActions(root, fix.files, {
                 artifactDir: patchArtifactDir,
                 patchName
-              });
+              }));
               for (const f of fix.files) {
                 if (f.path.endsWith("gradlew") || f.path.endsWith("mvnw")) {
-                  try { await runValidationCommand(root, `chmod +x ${f.path}`); } catch { /* ok */ }
+                  try { await runLangGraphTask("task_chmod_environment_fix", () => runValidationCommand(root, `chmod +x ${f.path}`)); } catch { /* ok */ }
                 }
                 if (!filesChanged.includes(f.path)) filesChanged.push(f.path);
               }
             }
             for (const cmd of fix.commands) {
-              try { await runValidationCommand(root, cmd.command); } catch { /* ok */ }
+              try { await runLangGraphTask("task_run_environment_fix_command", () => runValidationCommand(root, cmd.command)); } catch { /* ok */ }
             }
 
             // Retry the failed command
-            const retryResult = await runValidationCommand(root, result.command);
+            const retryResult = await runLangGraphTask("task_retry_environment_command", () => runValidationCommand(root, result.command));
             if (retryResult.exitCode === 0) {
               validationResults.push(retryResult);
               continue; // Success — continue to next command
@@ -285,20 +286,20 @@ export async function* executeTask(params: {
       for (let attempt = 0; attempt < config.maxRepairAttempts && failedResults.length > 0; attempt++) {
         yield { kind: "step_repair", stepIndex: i, attempt: attempt + 1, maxAttempts: config.maxRepairAttempts };
 
-        const repairContext = await collectProjectContext(root, config, step.description);
+        const repairContext = await runLangGraphTask("task_collect_repair_context", () => collectProjectContext(root, config, step.description));
         const errorSummary = failedResults
           .map((r) => `$ ${r.command}\nexitCode: ${r.exitCode}\n${r.stderr || r.stdout}`)
           .join("\n\n");
 
         let repairPlan;
         try {
-          repairPlan = await generateCodeActionPlan({
+          repairPlan = await runLangGraphTask("task_generate_repair_actions", () => generateCodeActionPlan({
             provider,
             model: config.model,
             task: `Fix validation errors from step [${step.id}] ${step.title}.\nOriginal task: ${step.description}\n\nCommand errors:\n${errorSummary}`,
             context: repairContext,
             onProgress: () => {}
-          });
+          }));
         } catch {
           break;
         }
@@ -308,7 +309,7 @@ export async function* executeTask(params: {
 
         if (repairPlan.files.length > 0) {
           const patchName = `step-${i + 1}-${step.id}-repair-${attempt + 1}.diff`;
-          const patchPreview = await createFileActionsPatch(root, repairPlan.files);
+          const patchPreview = await runLangGraphTask("task_create_repair_patch", () => createFileActionsPatch(root, repairPlan.files));
           if (patchPreview.patch.trim()) {
             yield { kind: "step_patch", stepIndex: i, patchName, patch: patchPreview.patch, files: patchPreview.filesChanged };
           }
@@ -325,10 +326,10 @@ export async function* executeTask(params: {
             yield { kind: "paused", reason: state.blockedReason ?? "Task paused before applying repair.", state };
             return;
           }
-          await applyFileActions(root, repairPlan.files, {
+          await runLangGraphTask("task_apply_repair_patch", () => applyFileActions(root, repairPlan.files, {
             artifactDir: patchArtifactDir,
             patchName
-          });
+          }));
           for (const f of repairPlan.files) {
             if (!filesChanged.includes(f.path)) filesChanged.push(f.path);
           }
@@ -349,7 +350,7 @@ export async function* executeTask(params: {
               yield { kind: "paused", reason: state.blockedReason ?? "Task paused before running repair command.", state };
               return;
             }
-            const result = await runValidationCommand(root, cmd.command);
+            const result = await runLangGraphTask("task_run_repair_command", () => runValidationCommand(root, cmd.command));
             newResults.push(result);
           }
         }
@@ -364,11 +365,11 @@ export async function* executeTask(params: {
       : failedResults.length === 0 ? "passed"
       : "failed";
 
-    const summary = await summarizeStepResult(provider, config.model, step, {
+    const summary = await runLangGraphTask("task_summarize_step", () => summarizeStepResult(provider, config.model, step, {
       filesChanged,
       verificationResult,
       errors: failedResults.map((r) => r.stderr || r.stdout)
-    });
+    }));
 
     const stepResult = buildStepResult(step, filesChanged, verificationResult, summary);
     state.completedSteps.push(stepResult);

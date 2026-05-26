@@ -140,6 +140,7 @@ function printChatHelp(): void {
   logger.info([
     ...chatCommandDefinitions.map((command) => `${command.usage.padEnd(19)} ${command.description}`),
     "Shift+Tab          Leave plan mode and return to normal chat",
+    "PageUp/PageDown    Scroll long chat output; Ctrl+PageUp/Ctrl+PageDown jumps to top/bottom",
     "",
     "For coding or command execution, describe what you want in natural language.",
     "The status bar shows model, root, mode, and runtime state throughout the chat.",

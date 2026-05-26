@@ -464,6 +464,27 @@ describe("chat status display", () => {
     expect(lines[7]).toContain("chat mode");
   });
 
+  it("can render older history with a scroll offset", () => {
+    const lines = renderChatFrame({
+      history: ["one", "two", "three", "four", "five", "six"],
+      historyScrollOffset: 2,
+      inputLabel: "you",
+      inputValue: "",
+      status: {
+        model: "deepseek-v4-pro",
+        projectRoot: "/tmp/example",
+        mode: "chat",
+        state: "idle"
+      },
+      columns: 80,
+      rows: 8
+    }).map(stripAnsiCodes);
+
+    expect(lines).toHaveLength(8);
+    expect(lines.slice(0, 3).map((line) => line.trim())).toEqual(["two", "three", "four"]);
+    expect(lines[4]).toBe("you>".padEnd(80));
+  });
+
   it("wraps long Chinese history lines to the terminal width", () => {
     const lines = renderChatFrame({
       history: ["assistant: 这是一个很长的中文段落，用来验证终端宽字符换行不会超过窗口宽度。"],
@@ -777,6 +798,57 @@ describe("chat terminal lifecycle", () => {
     terminal.stop();
     expect(stdout.listenerCount("resize")).toBe(0);
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("scrolls long chat history with page keys while reading input", async () => {
+    const stdin = new PassThrough() as PassThrough & {
+      isTTY: true;
+      isRaw: boolean;
+      setRawMode(mode: boolean): void;
+    };
+    const stdout = new PassThrough() as PassThrough & {
+      isTTY: true;
+      columns: number;
+      rows: number;
+      cursorTo?(x: number, y?: number): boolean;
+      clearScreenDown?(): boolean;
+    };
+    stdin.isTTY = true;
+    stdin.isRaw = false;
+    stdin.setRawMode = (mode: boolean) => {
+      stdin.isRaw = mode;
+    };
+    stdout.isTTY = true;
+    stdout.columns = 80;
+    stdout.rows = 8;
+
+    const terminal = new ChatTerminal({
+      model: "deepseek-v4-pro",
+      projectRoot: "/tmp/example",
+      mode: "chat",
+      state: "idle"
+    }, {
+      stdin: stdin as unknown as NodeJS.ReadStream,
+      stdout: stdout as unknown as NodeJS.WriteStream
+    });
+
+    terminal.start();
+    terminal.append(["history-1", "history-2", "history-3", "history-4", "history-5", "history-6"].join("\n"));
+    const read = terminal.readInput(false);
+    stdout.read();
+
+    stdin.emit("keypress", "", { name: "pageup" });
+    const pageUpFrame = stripAnsiCodes(stdout.read()?.toString("utf8") ?? "");
+    expect(pageUpFrame).toContain("history-2");
+    expect(pageUpFrame).not.toContain("history-6");
+
+    stdin.emit("keypress", "", { name: "pagedown" });
+    const pageDownFrame = stripAnsiCodes(stdout.read()?.toString("utf8") ?? "");
+    expect(pageDownFrame).toContain("history-6");
+
+    stdin.emit("keypress", "", { name: "enter" });
+    await expect(read).resolves.toEqual({ kind: "line", value: "" });
+    terminal.stop();
   });
 });
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.3 - 2026-05-26
+
+- LangGraph is now used as the internal agent workflow orchestration layer for planning, one-shot fix/run flows, chat-driven task execution, and resume paths.
+- Added `@langchain/langgraph` and `@langchain/core` as runtime dependencies while keeping CodeShit local-first and CLI-only.
+- Existing confirmation gates, patch artifacts, task state files, and safety policies remain unchanged.
+- Interactive chat now supports internal history scrolling with `PageUp`/`PageDown`, plus `Ctrl+PageUp`/`Ctrl+PageDown` to jump to the top or bottom of long output.
+- Long review reports, plan discussions, task execution logs, patch previews, and validation output can now be inspected without losing earlier content during TUI redraws.
+
 ## 0.3.2 - 2026-05-25
 
 - Global LLM config now supports multiple saved providers in `~/.codeshit/config.json` under `providers`.
